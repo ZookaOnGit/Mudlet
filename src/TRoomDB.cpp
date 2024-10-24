@@ -25,6 +25,7 @@
 #include "Host.h"
 #include "TArea.h"
 #include "T2DMap.h"
+#include "TEvent.h"
 #include "mudlet.h"
 
 #include "pre_guard.h"
@@ -296,6 +297,14 @@ bool TRoomDB::removeRoom(int id)
         }
         TRoom* pR = getRoom(id);
         delete pR;
+
+        TEvent event{};
+        event.mArgumentList.append(QLatin1String("sysMapDeleteRoom"));
+        event.mArgumentTypeList.append(ARGUMENT_TYPE_STRING);
+        event.mArgumentList.append(QString::number(id));
+        event.mArgumentTypeList.append(ARGUMENT_TYPE_NUMBER);
+        mpMap->mpHost->raiseEvent(event);
+
         return true;
     }
     return false;
@@ -322,6 +331,13 @@ void TRoomDB::removeRoom(QSet<int>& ids)
             delete pR;
         }
         mpTempRoomDeletionSet->remove(deleteRoomId);
+
+        TEvent event{};
+        event.mArgumentList.append(QLatin1String("sysMapDeleteRoom"));
+        event.mArgumentTypeList.append(ARGUMENT_TYPE_STRING);
+        event.mArgumentList.append(QString::number(deleteRoomId));
+        event.mArgumentTypeList.append(ARGUMENT_TYPE_NUMBER);
+        mpMap->mpHost->raiseEvent(event);
     }
     for (auto deleteRoomId : deletedRoomIds) {
         entranceMap.remove(deleteRoomId); // This has been deferred from __removeRoom()
