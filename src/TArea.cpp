@@ -376,7 +376,7 @@ void TArea::calcSpan()
     yminForZ.clear();
     xmaxForZ.clear();
     ymaxForZ.clear();
-    zLevels.clear();
+    QSet<int> zLevelSet;
 
     bool isFirstDone = false;
     QSetIterator<int> itRoom(rooms);
@@ -395,7 +395,7 @@ void TArea::calcSpan()
             max_y = min_y;
             min_z = pR->z();
             max_z = min_z;
-            zLevels.push_back(pR->z());
+            zLevelSet.insert(pR->z());
             xminForZ.insert(pR->z(), pR->x());
             xmaxForZ.insert(pR->z(), pR->x());
             yminForZ.insert(pR->z(), pR->y());
@@ -405,9 +405,7 @@ void TArea::calcSpan()
         } else {
             // Already had one valid room so now must check more things
 
-            if (!zLevels.contains(pR->z())) {
-                zLevels.push_back(pR->z());
-            }
+            zLevelSet.insert(pR->z());
 
             if (!xminForZ.contains(pR->z())) {
                 xminForZ.insert(pR->z(), pR->x());
@@ -459,8 +457,15 @@ void TArea::calcSpan()
         }
     }
 
-    if (zLevels.size() > 1) {
-        // Not essential but it makes debugging a bit clearer if they are sorted
+    const auto setSize = zLevelSet.size();
+    if (!setSize) {
+        zLevels.clear();
+        return;
+    }
+
+    zLevels = QList<int>{zLevelSet.cbegin(), zLevelSet.cend()};
+    if (setSize > 1) {
+        // We now need to it be sorted.
         // The {x|y}{min|max}ForZ are, by definition!
         std::sort(zLevels.begin(), zLevels.end());
     }

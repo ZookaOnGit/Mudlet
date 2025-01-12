@@ -1345,8 +1345,6 @@ void T2DMap::paintEvent(QPaintEvent* e)
         showRoomNames = (mapNameFont.pointSizeF() > 3.0);
     }
 
-    const int zLevel = mMapCenterZ;
-
     const float exitWidth = 1 / eSize * mRoomWidth * rSize;
 
     painter.fillRect(0, 0, width(), height(), mpHost->mBgColor_2);
@@ -1418,70 +1416,89 @@ void T2DMap::paintEvent(QPaintEvent* e)
     QSetIterator<int> itRoom(pDrawnArea->getAreaRooms());
 
     if (mudlet::self()->mDrawUpperLowerLevels) {
-        // draw room on lower z-levels
-        while (itRoom.hasNext()) {
-            const int currentAreaRoom = itRoom.next();
-            TRoom* room = mpMap->mpRoomDB->getRoom(currentAreaRoom);
-            if (!room) {
-                continue;
-            }
-
-            if (room->z() == zLevel - 1) {
-                const float rx = room->x() * mRoomWidth + static_cast<float>(mRX);
-                const float ry = room->y() * -1 * mRoomHeight + static_cast<float>(mRY);
-                if (rx >= 0 && ry >= 0 && rx <= widgetWidth && ry <= widgetHeight) {
-                    painter.save();
-                    painter.setPen(Qt::NoPen);
-                    painter.setBrush(mpHost->mLowerLevelColor);
-                    if (mBubbleMode) {
-                        const float roomRadius = 0.5 * rSize * mRoomWidth;
-                        const QPointF roomCenter = QPointF(rx - (roomRadius * rSize * 0.5), ry + (roomRadius * rSize * 0.5));
-                        QPainterPath diameterPath;
-                        diameterPath.addEllipse(roomCenter, roomRadius, roomRadius);
-                        painter.drawPath(diameterPath);
-                    } else {
-                        painter.drawRect(rx - (mRoomWidth * rSize * 0.8), ry - (mRoomHeight * rSize * 0.2), mRoomWidth * rSize, mRoomHeight * rSize);
-                    }
-                painter.restore();
+        // Determine the adjacent level above and below the current mMapCenterZ
+        std::optional<int> zLevelBelow;
+        std::optional<int> zLevelAbove;
+        for (int i = 0, total = pDrawnArea->zLevels.count(); i < total; ++i) {
+            if (pDrawnArea->zLevels.at(i) == mMapCenterZ) {
+                if (i+1 < total) {
+                    zLevelAbove = pDrawnArea->zLevels.at(i+1);
                 }
+                if (i > 0) {
+                    zLevelBelow = pDrawnArea->zLevels.at(i-1);
+                }
+                break;
             }
         }
-        itRoom.toFront();
 
-        // draw rooms on upper z-levels
-        while (itRoom.hasNext()) {
-            const int currentAreaRoom = itRoom.next();
-            TRoom* room = mpMap->mpRoomDB->getRoom(currentAreaRoom);
-            if (!room) {
-                continue;
-            }
+        if (zLevelBelow.has_value()) {
+            // draw room on lower z-levels
+            while (itRoom.hasNext()) {
+                const int currentAreaRoom = itRoom.next();
+                TRoom* room = mpMap->mpRoomDB->getRoom(currentAreaRoom);
+                if (!room) {
+                    continue;
+                }
 
-            if (room->z() == zLevel + 1) {
-                const float rx = room->x() * mRoomWidth + static_cast<float>(mRX);
-                const float ry = room->y() * -1 * mRoomHeight + static_cast<float>(mRY);
-                if (rx >= 0 && ry >= 0 && rx <= widgetWidth && ry <= widgetHeight) {
-                    painter.save();
-                    painter.setPen(QPen(mpHost->mUpperLevelColor, 1));
-                    painter.setBrush(Qt::transparent);
-                    if (mBubbleMode) {
-                        const float roomRadius = 0.5 * rSize * mRoomWidth;
-                        const QPointF roomCenter = QPointF(rx + (roomRadius * rSize * 0.5), ry - (roomRadius * rSize * 0.5));
-                        QPainterPath diameterPath;
-                        diameterPath.addEllipse(roomCenter, roomRadius, roomRadius);
-                        painter.drawPath(diameterPath);
-                    } else {
-                        painter.drawRect(rx - (mRoomWidth * rSize * 0.2), ry - (mRoomHeight * rSize * 0.8), mRoomWidth * rSize, mRoomHeight * rSize);
-                    }
+                if (room->z() == zLevelBelow.value()) {
+                    const float rx = room->x() * mRoomWidth + static_cast<float>(mRX);
+                    const float ry = room->y() * -1 * mRoomHeight + static_cast<float>(mRY);
+                    if (rx >= 0 && ry >= 0 && rx <= widgetWidth && ry <= widgetHeight) {
+                        painter.save();
+                        painter.setPen(Qt::NoPen);
+                        painter.setBrush(mpHost->mLowerLevelColor);
+                        if (mBubbleMode) {
+                            const float roomRadius = 0.5 * rSize * mRoomWidth;
+                            const QPointF roomCenter = QPointF(rx - (roomRadius * rSize * 0.5), ry + (roomRadius * rSize * 0.5));
+                            QPainterPath diameterPath;
+                            diameterPath.addEllipse(roomCenter, roomRadius, roomRadius);
+                            painter.drawPath(diameterPath);
+                        } else {
+                            painter.drawRect(rx - (mRoomWidth * rSize * 0.8), ry - (mRoomHeight * rSize * 0.2), mRoomWidth * rSize, mRoomHeight * rSize);
+                        }
                     painter.restore();
+                    }
                 }
             }
+            itRoom.toFront();
         }
-        itRoom.toFront();
+
+        if (zLevelAbove.has_value()) {
+            // draw rooms on upper z-levels
+            while (itRoom.hasNext()) {
+                const int currentAreaRoom = itRoom.next();
+                TRoom* room = mpMap->mpRoomDB->getRoom(currentAreaRoom);
+                if (!room) {
+                    continue;
+                }
+
+                if (room->z() == mMapCenterZ + 1) {
+                    const float rx = room->x() * mRoomWidth + static_cast<float>(mRX);
+                    const float ry = room->y() * -1 * mRoomHeight + static_cast<float>(mRY);
+                    if (rx >= 0 && ry >= 0 && rx <= widgetWidth && ry <= widgetHeight) {
+                        painter.save();
+                        painter.setPen(QPen(mpHost->mUpperLevelColor, 1));
+                        painter.setBrush(Qt::transparent);
+                        if (mBubbleMode) {
+                            const float roomRadius = 0.5 * rSize * mRoomWidth;
+                            const QPointF roomCenter = QPointF(rx + (roomRadius * rSize * 0.5), ry - (roomRadius * rSize * 0.5));
+                            QPainterPath diameterPath;
+                            diameterPath.addEllipse(roomCenter, roomRadius, roomRadius);
+                            painter.drawPath(diameterPath);
+                        } else {
+                            painter.drawRect(rx - (mRoomWidth * rSize * 0.2), ry - (mRoomHeight * rSize * 0.8), mRoomWidth * rSize, mRoomHeight * rSize);
+                        }
+                        painter.restore();
+                    }
+                }
+            }
+            itRoom.toFront();
+        }
     }
 
     // draw room exits
     if (!pDrawnArea->gridMode) {
-        paintRoomExits(painter, pen, exitList, oneWayExits, pDrawnArea, zLevel, exitWidth, areaExitsMap);
+        paintRoomExits(painter, pen, exitList, oneWayExits, pDrawnArea, exitWidth, areaExitsMap);
     }
 
     // now draw rooms on selected z-level
@@ -1492,7 +1509,7 @@ void T2DMap::paintEvent(QPaintEvent* e)
             continue;
         }
 
-        if (room->z() != zLevel) {
+        if (room->z() != mMapCenterZ) {
             continue;
         }
 
@@ -1757,7 +1774,7 @@ void T2DMap::drawDoor(QPainter& painter, const TRoom& room, const QString& dirKe
     painter.restore();
 }
 
-void T2DMap::paintRoomExits(QPainter& painter, QPen& pen, QList<int>& exitList, QList<int>& oneWayExits, const TArea* pArea, int zLevel, float exitWidth, QMap<int, QPointF>& areaExitsMap)
+void T2DMap::paintRoomExits(QPainter& painter, QPen& pen, QList<int>& exitList, QList<int>& oneWayExits, const TArea* pArea, float exitWidth, QMap<int, QPointF>& areaExitsMap)
 {
     const float exitArrowScale = (mLargeAreaExitArrows ? 2.0f : 1.0f);
     const float widgetWidth = width();
@@ -1809,7 +1826,7 @@ void T2DMap::paintRoomExits(QPainter& painter, QPen& pen, QList<int>& exitList, 
         const float ry = room->y() * -1 * mRoomHeight + mRY;
         const int rz = room->z();
 
-        if (rz != zLevel) {
+        if (rz != mMapCenterZ) {
             continue;
         }
 
