@@ -4918,6 +4918,90 @@ describe("Window and label state", function()
     end)
   end)
 
+  -- Called without a window name these write the profile's own colours, and
+  -- the main console has to pick them up at once: the next echo and the next
+  -- echoed command are drawn with them.
+  describe("main console colours", function()
+    local savedBg, savedCommand, savedEchoMode
+
+    local function readFormatOf(text)
+      local last = getLastLineNumber("main")
+      for line = last, math.max(0, last - 3), -1 do
+        moveCursor("main", 0, line)
+        if selectString(text, 1) >= 0 then
+          local format = getTextFormat("main")
+          deselect()
+          return format
+        end
+      end
+      error(("'%s' did not reach the main console"):format(text))
+    end
+
+    local function sendAndReadItsFormat(command)
+      send(command, true)
+      return readFormatOf(command)
+    end
+
+    setup(function()
+      -- the command colours are read off an echoed command, which the profile's
+      -- own echo setting could otherwise hide
+      savedEchoMode = getConfig("showSentText", true)
+      setConfig("showSentText", "script")
+      savedBg = {getBackgroundColor()}
+      -- there is no Lua reader for the command colours, but an echoed command
+      -- is drawn in them
+      savedCommand = sendAndReadItsFormat(name("mccSavedCommand"))
+    end)
+
+    teardown(function()
+      setConfig("showSentText", savedEchoMode)
+      -- these are unset when setup failed, and that failure is the one worth reading
+      if savedBg then
+        setBackgroundColor(savedBg[1], savedBg[2], savedBg[3], savedBg[4])
+      end
+      if savedCommand then
+        setCommandForegroundColor(unpack(savedCommand.foreground))
+        -- getTextFormat() gives no alpha, so this restores the command background opaque
+        setCommandBackgroundColor(unpack(savedCommand.background))
+      end
+      resetFormat()
+    end)
+
+    it("setBackgroundColor moves the console's background and what is echoed next", function()
+      assert.are_not.same({17, 34, 51, 200}, savedBg, "the profile already uses this background")
+      assert.is_true(setBackgroundColor(17, 34, 51, 200))
+      assert.are.same({17, 34, 51, 200}, {getBackgroundColor()})
+
+      resetFormat()
+      local text = name("mccEchoAfterBackground")
+      echo(text .. "\n")
+      assert.are.same({17, 34, 51}, readFormatOf(text).background)
+    end)
+
+    it("setCommandForegroundColor and setCommandBackgroundColor colour the next echoed command", function()
+      assert.are_not.same({10, 20, 30}, savedCommand.foreground, "the profile already uses this command foreground")
+      assert.are_not.same({40, 50, 60}, savedCommand.background, "the profile already uses this command background")
+      assert.is_true(setCommandForegroundColor(10, 20, 30))
+      assert.is_true(setCommandBackgroundColor(40, 50, 60))
+
+      local format = sendAndReadItsFormat(name("mccCommand"))
+      assert.are.same({10, 20, 30}, format.foreground)
+      assert.are.same({40, 50, 60}, format.background)
+    end)
+
+    it("all three reject a colour component outside 0-255 without a window name", function()
+      local ok, err = setBackgroundColor(0, 0, 256)
+      assert.is_nil(ok)
+      assert.are.equal("blue value 256 needs to be between 0-255", err)
+      local ok2, err2 = setCommandForegroundColor(300, 0, 0)
+      assert.is_nil(ok2)
+      assert.are.equal("red value 300 needs to be between 0-255", err2)
+      local ok3, err3 = setCommandBackgroundColor(0, 0, 0, 999)
+      assert.is_nil(ok3)
+      assert.are.equal("alpha value 999 needs to be between 0-255", err3)
+    end)
+  end)
+
   describe("getImageSize", function()
     it("returns the size of a bundled image", function()
       local w, h = getImageSize(":/icons/mudlet.png")
@@ -5006,6 +5090,22 @@ describe("Window and label state", function()
       local ok, err = setWindow(unknown, label, 0, 0, true)
       assert.is_nil(ok)
       assert.are.equal(("window '%s' not found"):format(unknown), err)
+    end)
+
+    -- Moving the map out of its dock widget would split it from a parent it
+    -- cannot be put back into, and naming that widget as a destination would
+    -- otherwise fall through to a plain "not found", reading as though the
+    -- profile had no map at all
+    it("refuses to move the map out of its floating/dockable window, or to put anything into it (#6510)", function()
+      assert.is_true(openMapWidget())
+
+      local moved, movedErr = setWindow("main", "mapper", 0, 0, true)
+      assert.is_nil(moved)
+      assert.are.equal("element 'mapper' is the map in a floating/dockable window and may not be moved", movedErr)
+
+      local received, receivedErr = setWindow("mapper", label, 0, 0, true)
+      assert.is_nil(received)
+      assert.are.equal("window 'mapper' is the map in a floating/dockable window and may not receive other elements", receivedErr)
     end)
   end)
 
@@ -5971,6 +6071,33 @@ describe("Console buffer size", function()
     assert.are.equal(savedText, getSelection(console))
   end)
 
+  -- The trim looks a few lines ahead of the one it is removing, and with the
+  -- biggest batch a buffer can have there are next to none left to look at by
+  -- the time it finishes.
+  it("a batch that takes all but a couple of lines leaves the newest ones in order", function()
+    clearWindow(console)
+    assert.is_true(setConsoleBufferSize(console, 100, 99))
+    assert.are.same({100, 99}, {getConsoleBufferSize(console)})
+    local removed = {}
+    local handlerId = registerAnonymousEventHandler("sysBufferShrinkEvent", function(_, windowName, removedLines)
+      if windowName == console then
+        removed[#removed + 1] = removedLines
+      end
+    end)
+    finally(function() killAnonymousEventHandler(handlerId) end)
+    for lineNumber = 1, 150 do
+      echo(console, ("nearly all line %d\n"):format(lineNumber))
+    end
+    killAnonymousEventHandler(handlerId)
+    assert.are.same({99}, removed)
+    local last = getLastLineNumber(console)
+    local lines = getLines(console, last - 3, last)
+    assert.are.same({"nearly all line 148", "nearly all line 149", "nearly all line 150"}, lines)
+    -- the count is the index of the open line at the end, so it is the number
+    -- of finished lines above it
+    assert.are.equal(150 - 99, getLineCount(console))
+  end)
+
   it("useMaximum raises the main console to the buffer maximum", function()
     -- the main console has to be named for this one: with three arguments the
     -- first is read as a window name, so the four argument form only lines up
@@ -6610,6 +6737,26 @@ describe("Toolbar buttons", function()
       local setOk, setErr = setButtonState(plainButton, true)
       assert.is_nil(setOk)
       assert.are.equal(("item with name '%s' is not a push-down button"):format(plainButton), setErr)
+    end)
+
+    it("round-trips a button state by ID", function()
+      local id = findItems(pushDownButton, "button")[1]
+      assert.is_number(id, "the package did not install " .. pushDownButton)
+      assert.is_false(getButtonState(id))
+      assert.is_true(setButtonState(id, true))
+      assert.is_true(getButtonState(id))
+      assert.is_true(getButtonState(pushDownButton), "the ID and the name should be the same button")
+    end)
+
+    it("both refuse a button that is not a push-down one when it is given by ID", function()
+      local id = findItems(plainButton, "button")[1]
+      assert.is_number(id, "the package did not install " .. plainButton)
+      local getOk, getErr = getButtonState(id)
+      assert.is_nil(getOk)
+      assert.are.equal(("item ID with %d is not a push-down button"):format(id), getErr)
+      local setOk, setErr = setButtonState(id, true)
+      assert.is_nil(setOk)
+      assert.are.equal(("item ID with %d is not a push-down button"):format(id), setErr)
     end)
 
     it("both refuse a name that is no button at all", function()
@@ -7572,5 +7719,19 @@ describe("calcFontSize on the main window", function()
     assert.is_true(mainWidth > 0)
     assert.is_true(miniWidth > 0)
     assert.are_not.equal(mainWidth, miniWidth)
+  end)
+end)
+
+describe("openUserWindow docking areas", function()
+  local windowName = ("uiSpecDockNowhere%d%d"):format(os.time(), math.random(100000))
+
+  teardown(function()
+    hideWindow(windowName)
+  end)
+
+  it("refuses an area it does not know, naming the ones it does", function()
+    local ok, message = openUserWindow(windowName, false, true, "middle")
+    assert.is_nil(ok)
+    assert.are.equal([[docking option "middle" not available. available docking options are "t" top, "b" bottom, "r" right, "l" left and "f" floating]], message)
   end)
 end)
