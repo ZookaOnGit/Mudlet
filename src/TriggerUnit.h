@@ -99,11 +99,26 @@ public:
     // Both paths build the same index, so this is how a test checks the incremental path keeps full
     // rebuilds flat.
     quint64 prescanRebuildCount() const { return mPrescanRebuilds; }
+    // The whole-tree index - see TTrigger::skippableForLine() and docs/platform-builds.md
+    enum class TreeIndexMode { Off, On, Verify };
+    static TreeIndexMode treeIndexMode() { return smTreeIndexMode; }
+    static bool treeIndexVerifying() { return smTreeIndexMode == TreeIndexMode::Verify; }
+    // Call on any change to a trigger's place below a root or to what its treeIndexGrams() answers:
+    // the trigger is visited until the next rebuild files it again
+    void unfileTreeNode(TTrigger* pT);
+    // Triggers the last rebuild filed, so a spec can tell the index is armed before it relies on it
+    int treeIndexFiledCount() const { return static_cast<int>(mTreeNodes.size()); }
     void doCleanup();
     void uninstall(const QString&);
     void _uninstall(TTrigger* pChild, const QString& packageName);
 
     int processingDepth() const { return mProcessingDepth; }
+    // Set once feedTriggers() reaches scmMaxProcessingDepth, cleared when the feed that started
+    // the chain returns to the outermost pass, so other triggers on that line can still feed.
+    // A trigger that feeds two matching lines branches at every level, so refusing only the
+    // feeds at the limit still leaves 2^50 of them to run below it.
+    bool runawayFeedStopped() const { return mRunawayFeedStopped; }
+    void stopRunawayFeed() { mRunawayFeedStopped = true; }
     // Raw pointer is safe: a trigger outlives its own execute() frame, as deletion
     // is deferred to doCleanup() once mProcessingDepth returns to 0.
     const QString* currentExecutingTriggerName() const { return mpCurrentExecutingTriggerName; }
@@ -144,6 +159,9 @@ public:
 
     QList<TTrigger*> uninstallList;
     bool hasPendingDeletes() const { return !mCleanupSet.isEmpty() || !uninstallList.isEmpty(); }
+    // Killed or uninstalled, itself or through an ancestor, but still in the lookup tables until doCleanup(),
+    // which an idle profile may not run for up to a minute
+    bool pendingDeletion(TTrigger* pItem) const;
 
 private:
     TriggerUnit() = default;
@@ -152,10 +170,17 @@ private:
     void addTriggerRootNode(TTrigger* pT, int parentPosition = -1, int childPosition = -1, bool moveTrigger = false);
     void addTrigger(TTrigger* pT);
     void removeTriggerRootNode(TTrigger* pT);
+    bool listRootNode(TTrigger* pT, std::list<TTrigger*>::iterator before);
+    void unlistRootNode(TTrigger* pT);
     void removeTrigger(TTrigger*);
     void startOrExtendSameLineChain(TTrigger* pT);
     void collectPrescanTasks(TTrigger* pT);
     void rebuildPrescanTasksIfStale();
+    static TreeIndexMode readTreeIndexMode();
+    void fileTreeNodes(TTrigger* pT, std::vector<quint64>& grams);
+    void clearTreeNodes();
+    void rebuildTreeIndex();
+    void stampTreeCandidates(const QString& line);
     void stopSameLineCreationLoop(const int chainId);
     void markRootNodeAppended(TTrigger* pT);
     void markRootNodeRemoved(TTrigger* pT);
@@ -180,6 +205,9 @@ private:
     int mRegexSearchesOnTheLastLine = 0;
     QMap<int, TTrigger*> mTriggerMap;
     std::list<TTrigger*> mTriggerRootNodeList;
+    // Where each root node sits in mTriggerRootNodeList: std::list::remove() walks the whole list,
+    // which made freeing a batch of temporary triggers quadratic
+    QHash<TTrigger*, std::list<TTrigger*>::iterator> mRootNodePositions;
     // What processDataStream() iterates instead of mTriggerRootNodeList. A pass pins the snapshot current
     // when it started, so a mid-pass mutation only affects the next pass. Every mutation of
     // mTriggerRootNodeList must set the flag below, or a pass would walk freed triggers.
@@ -204,6 +232,13 @@ private:
     std::vector<int> mCandidateScratch;
     std::vector<int> mCandidates;
     quint64 mPrescanRebuilds = 0;
+    static TreeIndexMode smTreeIndexMode;
+    // Every filed trigger, in walk order, at the last rebuild; a slot is nulled when its trigger goes:
+    // the next rebuild and any nested pass still read this list
+    std::vector<TTrigger*> mTreeNodes;
+    std::vector<int> mTreeHits;
+    TTriggerPrescan mTreeIndex;
+    bool mTreeIndexStale = true;
     quint32 mUnfilterableEpoch = 0;
     // Moves whenever a trigger changes in a way its TRootTriggerFilter copies,
     // which a pass that has pinned those copies has no other way to hear of
@@ -217,6 +252,7 @@ private:
     int statsPatternsActive = 0;
     // Counter for nested processing; cleanup deferred until 0
     int mProcessingDepth = 0;
+    bool mRunawayFeedStopped = false;
     // Decides whether summarising the next line is worth it; see TBigramFilter
     int mSubstringQuestionsOnTheLastLine = 0;
     const QString* mpCurrentExecutingTriggerName = nullptr;

@@ -55,17 +55,17 @@ void MMCPServer::incomingConnection(qintptr socketDescriptor)
 /**
  * Receive mud data from our current session
  */
-void MMCPServer::receiveFromPlayer(std::string& str)
+void MMCPServer::receiveFromPlayer(std::string& str, const bool endsWithPromptMarker)
 {
     if (mSnoopCount > 0) {
-        sendSnoopData(str);
+        sendSnoopData(str, endsWithPromptMarker);
     }
 }
 
 /**
  * Send mud data from our mud to all clients snooping us
  */
-void MMCPServer::sendSnoopData(std::string& lines)
+void MMCPServer::sendSnoopData(std::string& lines, const bool endsWithPromptMarker)
 {
 
     // Split the block into individual lines
@@ -80,6 +80,14 @@ void MMCPServer::sendSnoopData(std::string& lines)
     // clients and the other (outData2) which will be send to all other clients
 
     while (std::getline(iss, line)) {
+        // writeData() would show the prompt marker to the snooper as a '?'
+        if (endsWithPromptMarker && iss.eof() && !line.empty() && line.back() == '\xff') {
+            line.pop_back();
+            // GA straight after a line ending marks no prompt text at all
+            if (line.empty()) {
+                break;
+            }
+        }
         QByteArray outData1, outData2;
         outData1.append(static_cast<char>(SnoopData));
         outData2.append(static_cast<char>(SnoopData));
@@ -1001,9 +1009,44 @@ void MMCPServer::snoopMessage(const std::string& message)
 {
     using namespace AnsiColors;
 
+    // The prefix's reset would take the colour off every line after the first for a
+    // peer whose colour MMCPClient does not track, so the style in force is put back
+    // after it. Bounded, as a peer can send any number of escapes.
+    constexpr std::size_t maxReplayedStyle = 64;
+    std::string activeStyle;
     std::stringstream ss;
     ss << FBLDGRN << ">>" << RST;
-    ss << message << "\n";
+    for (std::size_t i = 0; i < message.size(); ++i) {
+        const char c = message[i];
+        if (c == '\n') {
+            ss << c << FBLDGRN << ">>" << RST << activeStyle;
+            continue;
+        }
+        if (c == '\x1b' && i + 1 < message.size() && message[i + 1] == '[') {
+            std::size_t end = i + 2;
+            while (end < message.size() && message[end] >= 0x20 && message[end] < 0x40) {
+                ++end;
+            }
+            if (end < message.size()) {
+                const std::string sequence = message.substr(i, end - i + 1);
+                if (message[end] == 'm') {
+                    const std::string parameters = message.substr(i + 2, end - i - 2);
+                    const bool resets = parameters.empty() || parameters == "0" || parameters.starts_with("0;");
+                    if (resets || activeStyle.size() + sequence.size() > maxReplayedStyle) {
+                        activeStyle.clear();
+                    }
+                    if (parameters != "0" && !parameters.empty() && sequence.size() <= maxReplayedStyle) {
+                        activeStyle += sequence;
+                    }
+                }
+                ss << sequence;
+                i = end;
+                continue;
+            }
+        }
+        ss << c;
+    }
+    ss << "\n";
 
     std::string outStr = ss.str();
 

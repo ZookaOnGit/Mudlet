@@ -480,6 +480,14 @@ const TChar* uniformWindowColors(TBuffer& buffer, const std::vector<TChar>* pPas
     }
     return buffer.preTriggerPassLineUniformColors(line);
 }
+
+// A highlight goes on the line the pass was handed, wherever triggers earlier in the
+// pass moved it, not on the cursor's line, which they may have moved elsewhere
+bool selectOnTriggerPassLine(Host* pHost, const int lineNumber, const int from, const int length)
+{
+    TConsoleModel& model = pHost->mainConsoleModel();
+    return model.selectSectionOnLine(model.buffer.triggerPassLineNow(lineNumber), from, length);
+}
 } // namespace
 
 // Some extraordinary numbers outside of the range (0-255) used for ANSI colors:
@@ -565,6 +573,8 @@ static void pcre2_match_data_deleter(pcre2_match_data* pointer)
 }
 
 quint64 TTrigger::smStructureGeneration = 0;
+quint32 TTrigger::smLineStamp = 0;
+int TTrigger::smPassDepth = 0;
 quint64 TTrigger::smRegexSearches = 0;
 quint32 TTrigger::smPrescanPassId = 0;
 quint32 TTrigger::smPrescanPassIdCounter = 0;
@@ -618,6 +628,8 @@ bool TTrigger::setRegexCodeList(QStringList patterns, QList<int> patternKinds, b
     }
 
     bool state = true;
+    // Collected, as setError() replaces the previous error
+    QStringList patternErrors;
 
     if (existingTrigger) {
         for (int i = 0; i < patterns.size(); i++) {
@@ -675,12 +687,14 @@ bool TTrigger::setRegexCodeList(QStringList patterns, QList<int> patternKinds, b
                         TDebug(Qt::white, Qt::red, TDebug::Category::Error, mName) << "REGEX ERROR: failed to compile, reason:\n" << error << "\n" >> mpHost;
                         TDebug(Qt::red, Qt::gray, TDebug::Category::Error, mName) << TDebug::csmContinue << R"(in: ")" << regexp.constData() << "\"\n" >> mpHost;
                     }
-                    setError(qsl("<b>%1</b>")
-                                     .arg(tr(R"(Error: in item %1, perl regex "%2" failed to compile, reason: "%3".)")
-                                                  .arg(QString::number(i + 1), QString(regexp.constData()).toHtmlEscaped(), QString(error).toHtmlEscaped())));
+                    patternErrors.append(qsl("<b>%1</b>")
+                                                 .arg(tr(R"(Error: in item %1, perl regex "%2" failed to compile, reason: "%3".)")
+                                                              .arg(QString::number(i + 1), QString(regexp.constData()).toHtmlEscaped(), QString(error).toHtmlEscaped())));
                     state = false;
                 } else {
-                    mRegexJitCompiled[patternIndex] = (pcre2_jit_compile(re.data(), PCRE2_JIT_COMPLETE) == 0);
+                    // A (*NO_JIT) pattern compiles "successfully" to no JIT code, and pcre2_jit_match() then fails every subject
+                    size_t jitSize = 0;
+                    mRegexJitCompiled[patternIndex] = pcre2_jit_compile(re.data(), PCRE2_JIT_COMPLETE) == 0 && pcre2_pattern_info(re.data(), PCRE2_INFO_JITSIZE, &jitSize) == 0 && jitSize > 0;
                     // Once per pattern of every trigger created, so it is high-volume trigger detail
                     if (TDebug::wants(TDebug::Category::TriggerDetail)) {
                         TDebug(Qt::white, Qt::darkGreen, TDebug::Category::TriggerDetail, mName) << "[OK]: REGEX_COMPILE OK\n" >> mpHost;
@@ -698,8 +712,9 @@ bool TTrigger::setRegexCodeList(QStringList patterns, QList<int> patternKinds, b
                 const QString code = qsl("function %1() %2\nend").arg(funcName.c_str(), patterns[i]);
                 QString error;
                 if (!mpLua->compile(code, error, QString::fromStdString(funcName))) {
-                    setError(qsl("<b>%1</b>")
-                                     .arg(tr(R"(Error: in item %1, lua function "%2" failed to compile, reason: "%3".)").arg(QString::number(i + 1), patterns.at(i).toHtmlEscaped(), QString(error))));
+                    patternErrors.append(
+                            qsl("<b>%1</b>")
+                                    .arg(tr(R"(Error: in item %1, lua function "%2" failed to compile, reason: "%3".)").arg(QString::number(i + 1), patterns.at(i).toHtmlEscaped(), QString(error))));
                     state = false;
                     if (TDebug::wants(TDebug::Category::Error)) {
                         TDebug(Qt::white, Qt::red, TDebug::Category::Error, mName) << "LUA ERROR: failed to compile, reason:\n" << error << "\n" >> mpHost;
@@ -717,9 +732,9 @@ bool TTrigger::setRegexCodeList(QStringList patterns, QList<int> patternKinds, b
                 TTrigger::decodeColorPatternText(patterns.at(i), textAnsiFg, textAnsiBg);
 
                 if (textAnsiBg == scmIgnored && textAnsiFg == scmIgnored) {
-                    setError(qsl("<b>%1</b>")
-                                     .arg(tr("Error: in item %1, no colors to match were set - at least <i>one</i> of the foreground or background must not be <i>ignored</i>.")
-                                                  .arg(QString::number(i + 1))));
+                    patternErrors.append(qsl("<b>%1</b>")
+                                                 .arg(tr("Error: in item %1, no colors to match were set - at least <i>one</i> of the foreground or background must not be <i>ignored</i>.")
+                                                              .arg(QString::number(i + 1))));
                     state = false;
                     mColorPatternList.emplace_back(nullptr);
                     continue;
@@ -728,6 +743,9 @@ bool TTrigger::setRegexCodeList(QStringList patterns, QList<int> patternKinds, b
                 // The setupColorTrigger(...) method will push_back the created
                 // TColorTable instance if it is successful:
                 if (!setupColorTrigger(textAnsiFg, textAnsiBg)) {
+                    //: %1 is the number of the pattern in the trigger's list, %2 is the color pattern as saved
+                    patternErrors.append(
+                            qsl("<b>%1</b>").arg(tr(R"(Error: in item %1, color pattern "%2" names no color that can be matched.)").arg(QString::number(i + 1), patterns.at(i).toHtmlEscaped())));
                     mColorPatternList.emplace_back(nullptr);
                     state = false;
                     continue;
@@ -738,6 +756,9 @@ bool TTrigger::setRegexCodeList(QStringList patterns, QList<int> patternKinds, b
         }
     }
 
+    if (!state) {
+        setError(patternErrors.join(qsl("<br>")));
+    }
     mOK_init = state;
     rebuildPrescanGrams();
     return state;
@@ -794,6 +815,61 @@ void TTrigger::rebuildPrescanGrams()
     }
     mPatternBigrams = std::move(patternBigrams);
     invalidatePrescan();
+    invalidateTreeIndex();
+}
+
+void TTrigger::invalidateTreeIndex()
+{
+    // A root is never filed, so the temporary triggers scripts arm every line cost no rebuild
+    if (mpHost && (mTreeIndexPosition >= 0 || getParent())) {
+        if (auto* unit = mpHost->getTriggerUnit()) {
+            unit->unfileTreeNode(this);
+        }
+    }
+}
+
+bool TTrigger::verifySkippable(const TUtf8Subject& subject, const QString& haystack, const int line, const int posOffset, const TBigramFilter* pLineBigrams)
+{
+    // A multiline trigger can act by opening a state without firing
+    const size_t statesBefore = mConditionMap.size();
+    const bool fired = match(subject, haystack, line, posOffset, pLineBigrams, false);
+    if (fired || mConditionMap.size() != statesBefore) {
+        qWarning().nospace() << "TTrigger tree index MISS: trigger " << mName << " (id " << mID << ", patterns " << mPatterns << ") acted on line " << line << ": " << haystack.left(160);
+    }
+    return fired;
+}
+
+bool TTrigger::treeIndexGrams(std::vector<quint64>& grams) const
+{
+    grams.clear();
+    // A line trigger fires on a count, and a trigger without patterns passes every line to its children
+    if (mIsLineTrigger || mPatterns.isEmpty()) {
+        return false;
+    }
+    const int count = mIsMultiline ? 1 : static_cast<int>(mPatterns.size());
+    for (int i = 0; i < count; ++i) {
+        quint64 gram = 0;
+        switch (mPatternKinds.at(i)) {
+        case REGEX_SUBSTRING:
+        case REGEX_BEGIN_OF_LINE_SUBSTRING:
+        case REGEX_EXACT_MATCH:
+            gram = TTriggerPrescan::patternGram(mPatterns.at(i));
+            break;
+        case REGEX_PERL:
+            if (mRegexLiterals[i].matcher) {
+                gram = TTriggerPrescan::patternGram(mRegexLiterals[i].matcher->pattern());
+            }
+            break;
+        default:
+            break;
+        }
+        if (!gram) {
+            grams.clear();
+            return false;
+        }
+        grams.push_back(gram);
+    }
+    return true;
 }
 
 // Call on anything that changes whether or how the trigger can be filtered; the unit refiles it from
@@ -853,12 +929,16 @@ TRootTriggerFilter TTrigger::rootFilter() const
     return filter;
 }
 
-bool TTrigger::uniformLineColors(Host* pHost, const int line, QRgb& foreground, QRgb& background)
+bool TTrigger::uniformLineColors(Host* pHost, int line, QRgb& foreground, QRgb& background)
 {
-    if (!pHost || line < 0) {
+    if (!pHost) {
         return false;
     }
     TBuffer& buffer = pHost->mainConsoleModel().buffer;
+    line = buffer.triggerPassLineNow(line);
+    if (line < 0) {
+        return false;
+    }
     if (line >= static_cast<int>(buffer.buffer.size())) {
         return false;
     }
@@ -977,7 +1057,6 @@ void TTrigger::processRegexMatch(const char* haystackC,
     }
 
     int i = 0;
-    int numberOfCaptureGroups = 0;
     // One cursor for the whole call, so the match-all loop walks the line once rather than once per match
     PCRE2_SIZE cursorByteOffset = 0;
     int cursorCodeUnits = 0;
@@ -1029,9 +1108,21 @@ void TTrigger::processRegexMatch(const char* haystackC,
             namePositions.insert(name, qMakePair(utf16_pos + posOffset, static_cast<int>(capture.length())));
         }
     }
-    if (mIsColorizerTrigger || mFilterTrigger) {
-        numberOfCaptureGroups = captureList.size();
+    // Highlights and filters skip a match's whole-match entry when it has groups. Tracked per match:
+    // PCRE2 reports groups only up to the highest that took part, so matches add differing counts
+    const bool trackWholeMatches = mIsColorizerTrigger || mFilterTrigger;
+    std::vector<bool> wholeMatchSkipped;
+    auto noteMatch = [&wholeMatchSkipped](const int entries) {
+        wholeMatchSkipped.push_back(entries > 1);
+        if (entries > 1) {
+            wholeMatchSkipped.insert(wholeMatchSkipped.end(), entries - 1, false);
+        }
+    };
+    if (trackWholeMatches) {
+        noteMatch(rc);
     }
+    // -1 until the first empty match asks
+    int anchoredRetryByJit = -1;
     for (; mPerlSlashGOption;) {
         uint32_t options = 0;
         const PCRE2_SIZE start_offset = ovector[1];
@@ -1043,13 +1134,39 @@ void TTrigger::processRegexMatch(const char* haystackC,
             options = PCRE2_NOTEMPTY_ATSTART | PCRE2_ANCHORED;
         }
 
-        rc = pcre2_match(re.data(), reinterpret_cast<PCRE2_SPTR>(haystackC), haystackCLength, start_offset, options, match_data, nullptr);
+        if (options != 0 && anchoredRetryByJit < 0) {
+            // pcre2's JIT cannot take PCRE2_ANCHORED, and the interpreter rescans the rest of a
+            // PCRE2_MATCH_INVALID_UTF subject on every call. An unanchored search tries start_offset
+            // first, so a match it reports there is the anchored one - unless \K moved the start,
+            // or the subject is invalid UTF-8, where the JIT and the interpreter disagree.
+            anchoredRetryByJit = mRegexJitCompiled[patternNumber] && mPatternsUtf8[patternNumber].find("\\K") == std::string::npos && QByteArrayView(haystackC, haystackCLength).isValidUtf8();
+        }
+        if (options != 0 && anchoredRetryByJit == 1) {
+            rc = pcre2_jit_match(re.data(), reinterpret_cast<PCRE2_SPTR>(haystackC), haystackCLength, start_offset, PCRE2_NOTEMPTY_ATSTART, match_data, nullptr);
+            if (rc >= 0 && ovector[0] != start_offset) {
+                rc = PCRE2_ERROR_NOMATCH;
+            }
+            if (rc == PCRE2_ERROR_NOMATCH) {
+                // The step below tells the next search from this empty match by ovector[0]
+                ovector[0] = start_offset;
+            } else if (rc < 0) {
+                rc = pcre2_match(re.data(), reinterpret_cast<PCRE2_SPTR>(haystackC), haystackCLength, start_offset, options, match_data, nullptr);
+            }
+        } else {
+            rc = pcre2_match(re.data(), reinterpret_cast<PCRE2_SPTR>(haystackC), haystackCLength, start_offset, options, match_data, nullptr);
+        }
 
         if (rc == PCRE2_ERROR_NOMATCH) {
             if (options == 0) {
                 break;
             }
-            ovector[1] = start_offset + 1;
+            // Past the whole character, as pcre2demo.c does: PCRE2_MATCH_INVALID_UTF
+            // matches empty at an offset inside one, a match of its own in every result
+            PCRE2_SIZE nextOffset = start_offset + 1;
+            while (nextOffset < static_cast<PCRE2_SIZE>(haystackCLength) && (static_cast<unsigned char>(haystackC[nextOffset]) & 0xC0) == 0x80) {
+                ++nextOffset;
+            }
+            ovector[1] = nextOffset;
             continue;
         } else if (rc < 0) { // NOLINT(readability-else-after-return)
             goto END;
@@ -1070,6 +1187,9 @@ void TTrigger::processRegexMatch(const char* haystackC,
                 TDebug(Qt::darkMagenta, Qt::black, TDebug::Category::TriggerDetail, mName) << "<" << captureList.back().c_str() << ">\n" >> mpHost;
             }
         }
+        if (trackWholeMatches) {
+            noteMatch(rc);
+        }
     }
 
 END: {
@@ -1080,35 +1200,22 @@ END: {
         const int r2 = mFgColor.red();
         const int g2 = mFgColor.green();
         const int b2 = mFgColor.blue();
-        const int total = captureList.size();
         mpHost->deselectMainConsole();
         auto its = captureList.begin();
         auto iti = posList.begin();
-        for (int position = 1; iti != posList.end(); ++iti, ++its, position++) {
+        for (int position = 0; iti != posList.end(); ++iti, ++its, ++position) {
+            if (wholeMatchSkipped[position]) {
+                continue;
+            }
             const int begin = *iti;
             const std::string& s = *its;
             const int length = QString::fromStdString(s).size();
-            if (total > 1) {
-                // skip complete match in Perl /g option type of triggers
-                // to enable people to highlight capture groups if there are any
-                // otherwise highlight complete expression match
-                if (position % numberOfCaptureGroups != 1) {
-                    mpHost->selectMainConsoleSection(begin, length);
-                    if (mBgColor != QColorConstants::Transparent) {
-                        mpHost->setMainConsoleBgColor(QColor(r1, g1, b1));
-                    }
-                    if (mFgColor != QColorConstants::Transparent) {
-                        mpHost->setMainConsoleFgColor(QColor(r2, g2, b2));
-                    }
-                }
-            } else {
-                mpHost->selectMainConsoleSection(begin, length);
-                if (mBgColor != QColorConstants::Transparent) {
-                    mpHost->setMainConsoleBgColor(QColor(r1, g1, b1));
-                }
-                if (mFgColor != QColorConstants::Transparent) {
-                    mpHost->setMainConsoleFgColor(QColor(r2, g2, b2));
-                }
+            selectTextMatch(lineNumber, begin, length);
+            if (mBgColor != QColorConstants::Transparent) {
+                mpHost->setMainConsoleBgColor(QColor(r1, g1, b1));
+            }
+            if (mFgColor != QColorConstants::Transparent) {
+                mpHost->setMainConsoleFgColor(QColor(r2, g2, b2));
             }
         }
         mpHost->resetMainConsoleFormat();
@@ -1117,28 +1224,14 @@ END: {
         updateMultistates(patternNumber, captureList, posList, &nameGroups);
         return;
     }
-    TLuaInterpreter* pL = mpHost->getLuaInterpreter();
-    pL->setCaptureGroups(captureList, posList);
-    pL->setCaptureNameGroups(nameGroups, namePositions);
-    execute();
-    pL->clearCaptureGroups();
+    executeWithCaptures(captureList, posList, lineNumber, &nameGroups, &namePositions);
     if (mFilterTrigger) {
         if (captureList.size() > 1) {
-            const int total = captureList.size();
             auto its = captureList.begin();
             auto iti = posList.begin();
-            for (int filterPosition = 1; iti != posList.end(); ++iti, ++its, filterPosition++) {
-                int begin = *iti;
-                std::string& s = *its;
-                if (total > 1 && numberOfCaptureGroups > 0) {
-                    // skip complete match in Perl /g option type of triggers
-                    // to enable people to highlight capture groups if there are any
-                    // otherwise highlight complete expression match
-                    if (filterPosition % numberOfCaptureGroups != 1) {
-                        filter(s, begin, lineNumber);
-                    }
-                } else {
-                    filter(s, begin, lineNumber);
+            for (int position = 0; iti != posList.end(); ++iti, ++its, ++position) {
+                if (!trackWholeMatches || !wholeMatchSkipped[position]) {
+                    filter(*its, *iti, lineNumber, mPositionsInCurrentColumns);
                 }
             }
         }
@@ -1188,7 +1281,7 @@ void TTrigger::processBeginOfLine(int patternNumber, int posOffset, int lineNumb
             const int begin = *iti;
             const std::string& s = *its;
             const int length = QString::fromStdString(s).size();
-            mpHost->selectMainConsoleSection(begin, length);
+            selectTextMatch(lineNumber, begin, length);
             if (mBgColor != QColorConstants::Transparent) {
                 mpHost->setMainConsoleBgColor(QColor(r1, g1, b1));
             }
@@ -1202,15 +1295,10 @@ void TTrigger::processBeginOfLine(int patternNumber, int posOffset, int lineNumb
         updateMultistates(patternNumber, captureList, posList);
         return;
     }
-    TLuaInterpreter* pL = mpHost->getLuaInterpreter();
-    pL->setCaptureGroups(captureList, posList);
-
-    // call lua trigger function with number of matches and matches itselves as arguments
-    execute();
-    pL->clearCaptureGroups();
+    executeWithCaptures(captureList, posList, lineNumber);
     if (mFilterTrigger) {
         if (!captureList.empty()) {
-            filter(captureList.front(), posList.front(), lineNumber);
+            filter(captureList.front(), posList.front(), lineNumber, mPositionsInCurrentColumns);
         }
     }
 }
@@ -1255,7 +1343,18 @@ void TTrigger::updateMultistates(int regexNumber, std::list<std::string>& captur
     }
 }
 
-void TTrigger::filter(std::string& capture, int& posOffset, int lineNumber)
+// Text patterns match the line as it arrived, so a match is found where earlier
+// triggers' edits have moved it, unless a colour filter above has done that already
+bool TTrigger::selectTextMatch(const int lineNumber, int from, int length) const
+{
+    TConsoleModel& model = mpHost->mainConsoleModel();
+    if (!mPositionsInCurrentColumns) {
+        std::tie(from, length) = model.buffer.triggerPassSpanNow(lineNumber, from, length);
+    }
+    return model.selectSectionOnLine(model.buffer.triggerPassLineNow(lineNumber), from, length);
+}
+
+void TTrigger::filter(std::string& capture, int& posOffset, int lineNumber, const bool positionsInCurrentColumns)
 {
     if (capture.empty()) {
         return;
@@ -1267,7 +1366,9 @@ void TTrigger::filter(std::string& capture, int& posOffset, int lineNumber)
     for (auto* triggerNode : *mpMyChildrenList) {
         auto* trigger = static_cast<TTrigger*>(triggerNode);
         // no line filter: a capture is not the line those bits were built from
+        const bool childWas = std::exchange(trigger->mPositionsInCurrentColumns, positionsInCurrentColumns);
         trigger->match(subject, text, lineNumber, posOffset, nullptr, true);
+        trigger->mPositionsInCurrentColumns = childWas;
     }
 }
 
@@ -1325,7 +1426,7 @@ void TTrigger::processSubstringMatch(const QString& haystack, const QString& nee
             const int begin = *iti;
             const std::string& s = *its;
             const int length = QString::fromStdString(s).size();
-            mpHost->selectMainConsoleSection(begin, length);
+            selectTextMatch(lineNumber, begin, length);
             if (mBgColor != QColorConstants::Transparent) {
                 mpHost->setMainConsoleBgColor(QColor(r1, g1, b1));
             }
@@ -1339,15 +1440,10 @@ void TTrigger::processSubstringMatch(const QString& haystack, const QString& nee
         updateMultistates(regexNumber, captureList, posList);
         return;
     }
-    TLuaInterpreter* pL = mpHost->getLuaInterpreter();
-    pL->setCaptureGroups(captureList, posList);
-
-    // call lua trigger function with number of matches and matches itselves as arguments
-    execute();
-    pL->clearCaptureGroups();
+    executeWithCaptures(captureList, posList, lineNumber);
     if (mFilterTrigger) {
         if (!captureList.empty()) {
-            filter(captureList.front(), posList.front(), lineNumber);
+            filter(captureList.front(), posList.front(), lineNumber, mPositionsInCurrentColumns);
         }
     }
 }
@@ -1363,15 +1459,23 @@ bool TTrigger::match_color_pattern(int line, int patternNumber, int posOffset, i
     bool canExecute = false;
     CaptureLists lists;
     TConsoleModel& consoleModel = mpHost->mainConsoleModel();
-    if (line >= static_cast<int>(consoleModel.buffer.buffer.size())) {
+    // Read where the line is now, but hand children the line as committed, which
+    // they resolve for themselves after this trigger's script has run
+    const int lineNow = consoleModel.buffer.triggerPassLineNow(line);
+    const bool detached = lineNow == TBuffer::csmDetachedTriggerPassLine;
+    if (!detached && (lineNow < 0 || lineNow >= static_cast<int>(consoleModel.buffer.buffer.size()))) {
         return false;
     }
-    std::vector<TChar>& bufferLine = consoleModel.buffer.buffer[line];
-    const QString& lineBuffer = consoleModel.buffer.lineBuffer[line];
+    const std::vector<TChar>& bufferLine = detached ? consoleModel.buffer.detachedTriggerPassLine() : consoleModel.buffer.buffer[lineNow];
+    const QString& lineBuffer = detached ? consoleModel.buffer.detachedTriggerPassLineText() : consoleModel.buffer.lineBuffer[lineNow];
     // Match against the colors as they arrived from the game, not as already
     // recolored by other triggers or scripts earlier in this trigger pass; with
     // no snapshot taken, or past its end, the line itself still holds them:
-    const std::vector<TChar>* pPassLine = consoleModel.buffer.preTriggerPassLine(line);
+    const std::vector<TChar>* pPassLine = consoleModel.buffer.preTriggerPassLine(lineNow);
+    if (haystackIsCapture && !mPositionsInCurrentColumns) {
+        // A text parent's capture is in the columns the line arrived with
+        std::tie(posOffset, length) = consoleModel.buffer.triggerPassSpanNow(line, posOffset, length);
+    }
     // Filter ("only pass matches") parents hand children just the matched
     // capture, so restrict the scan to that window; for top-level triggers
     // the window covers the whole line:
@@ -1417,7 +1521,7 @@ bool TTrigger::match_color_pattern(int line, int patternNumber, int posOffset, i
                && ((ansiBg == scmIgnored) || ((ansiBg == scmDefault) && character.backgroundRgba() == defaultBg) || (patternBgValid && character.backgroundRgba() == patternBg));
     };
 
-    if (const TChar* pUniformColors = uniformWindowColors(consoleModel.buffer, pPassLine, line, start, end)) {
+    if (const TChar* pUniformColors = uniformWindowColors(consoleModel.buffer, pPassLine, lineNow, start, end)) {
         if (!colorsMatch(*pUniformColors)) {
             return false;
         }
@@ -1426,7 +1530,7 @@ bool TTrigger::match_color_pattern(int line, int patternNumber, int posOffset, i
         return true;
     }
 
-    for (auto it = bufferLine.begin() + start; pos < end; ++it, ++pos) {
+    for (auto it = bufferLine.cbegin() + start; pos < end; ++it, ++pos) {
         const TChar& character = (pos < passLineSize) ? (*pPassLine)[pos] : *it;
         if (colorsMatch(character)) {
             if (matchBegin == -1) {
@@ -1470,7 +1574,7 @@ void TTrigger::processColorPattern(int patternNumber, std::list<std::string>& ca
             //                qDebug() << "TTrigger::match_color_pattern(" << line << "," << patternNumber << ") INFO - match found: " << (*its).c_str() << " size is:" << (*its).size();
             const std::string& s = *its;
             const int length = QString::fromStdString(s).size();
-            mpHost->selectMainConsoleSection(begin, length);
+            selectOnTriggerPassLine(mpHost, lineNumber, begin, length);
             if (mBgColor != QColorConstants::Transparent) {
                 mpHost->setMainConsoleBgColor(QColor(r1, g1, b1));
             }
@@ -1484,17 +1588,14 @@ void TTrigger::processColorPattern(int patternNumber, std::list<std::string>& ca
         updateMultistates(patternNumber, captureList, posList);
         return;
     }
-    TLuaInterpreter* pL = mpHost->getLuaInterpreter();
-    pL->setCaptureGroups(captureList, posList);
-    // call lua trigger function with number of matches and matches itselves as arguments
-    execute();
-    pL->clearCaptureGroups();
+    // Color matching reads the line in its current columns already
+    executeWithCaptures(captureList, posList, -1);
     if (mFilterTrigger) {
         if (!captureList.empty()) {
             auto it1 = captureList.begin();
             auto it2 = posList.begin();
             for (; it1 != captureList.end(); it1++, it2++) {
-                filter(*it1, *it2, lineNumber);
+                filter(*it1, *it2, lineNumber, true);
             }
         }
     }
@@ -1613,7 +1714,7 @@ void TTrigger::processExactMatch(int patternNumber, int posOffset, int lineNumbe
             const int begin = *iti;
             const std::string& s = *its;
             const int length = QString::fromStdString(s).size();
-            mpHost->selectMainConsoleSection(begin, length);
+            selectTextMatch(lineNumber, begin, length);
             if (mBgColor != QColorConstants::Transparent) {
                 mpHost->setMainConsoleBgColor(QColor(r1, g1, b1));
             }
@@ -1627,14 +1728,10 @@ void TTrigger::processExactMatch(int patternNumber, int posOffset, int lineNumbe
         updateMultistates(patternNumber, captureList, posList);
         return;
     }
-    TLuaInterpreter* pL = mpHost->getLuaInterpreter();
-    pL->setCaptureGroups(captureList, posList);
-    // call lua trigger function with number of matches and matches themselves as arguments
-    execute();
-    pL->clearCaptureGroups();
+    executeWithCaptures(captureList, posList, lineNumber);
     if (mFilterTrigger) {
         if (!captureList.empty()) {
-            filter(captureList.front(), posList.front(), lineNumber);
+            filter(captureList.front(), posList.front(), lineNumber, mPositionsInCurrentColumns);
         }
     }
 }
@@ -1883,18 +1980,21 @@ bool TTrigger::match(const TUtf8Subject& subject, const QString& haystack, int l
                 }
                 conditionMet = true;
                 TLuaInterpreter* pL = mpHost->getLuaInterpreter();
-                if (mFilterTrigger) {
+                if (!fireReachesLua()) {
+                    execute();
+                } else if (mFilterTrigger) {
                     // A filter reads the captures again once the script has run
                     pL->setMultiCaptureGroups(matchState->multiCaptureList, matchState->multiCapturePosList, matchState->nameCaptures);
                     execute();
+                    pL->clearCaptureGroups();
                 } else {
                     pL->setMultiCaptureGroups(std::move(matchState->multiCaptureList), std::move(matchState->multiCapturePosList), std::move(matchState->nameCaptures));
                     execute();
                     // Back into the state, whose destructor parks the nodes for
                     // the next fire to reuse
                     pL->takeBackMultiCaptureGroups(matchState->multiCaptureList, matchState->multiCapturePosList);
+                    pL->clearCaptureGroups();
                 }
-                pL->clearCaptureGroups();
                 if (mFilterTrigger) {
                     const std::list<std::list<std::string>>& multiCaptureList = matchState->multiCaptureList;
                     for (const auto& captures : multiCaptureList) {
@@ -1907,10 +2007,10 @@ bool TTrigger::match(const TUtf8Subject& subject, const QString& haystack, int l
                             // single line number applies here
                             if (total > 1) {
                                 if (i % total != 1) {
-                                    filter(s, p, -1);
+                                    filter(s, p, -1, mPositionsInCurrentColumns);
                                 }
                             } else {
-                                filter(s, p, -1);
+                                filter(s, p, -1, mPositionsInCurrentColumns);
                             }
                         }
                     }
@@ -1929,10 +2029,20 @@ bool TTrigger::match(const TUtf8Subject& subject, const QString& haystack, int l
             if (conditionMet || (mPatterns.empty())) {
                 for (auto* triggerNode : *mpMyChildrenList) {
                     auto* trigger = static_cast<TTrigger*>(triggerNode);
+                    // Only against the line itself: a filter chain's children see its captures, and
+                    // the index was built from the text a dropping subject does not carry
+                    if (pLineBigrams && !haystackIsCapture && trigger->skippableForLine() && !subject.dropsText()) {
+                        if (Q_UNLIKELY(TriggerUnit::treeIndexVerifying()) && trigger->verifySkippable(subject, haystack, line, posOffset, pLineBigrams)) {
+                            conditionMet = true;
+                        }
+                        continue;
+                    }
                     if (pLineBigrams && trigger->cannotMatch(*pLineBigrams, haystack) && !subject.dropsText()) {
                         continue;
                     }
+                    const bool childWas = std::exchange(trigger->mPositionsInCurrentColumns, mPositionsInCurrentColumns);
                     ret = trigger->match(subject, haystack, line, posOffset, pLineBigrams, haystackIsCapture);
+                    trigger->mPositionsInCurrentColumns = childWas;
                     if (ret) {
                         conditionMet = true;
                     }
@@ -1950,7 +2060,9 @@ bool TTrigger::match(const TUtf8Subject& subject, const QString& haystack, int l
             }
             for (auto* triggerNode : *mpMyChildrenList) {
                 auto* trigger = static_cast<TTrigger*>(triggerNode);
+                const bool childWas = std::exchange(trigger->mPositionsInCurrentColumns, mPositionsInCurrentColumns);
                 ret = trigger->match(subject, haystack, line, posOffset, pLineBigrams, haystackIsCapture);
+                trigger->mPositionsInCurrentColumns = childWas;
                 if (ret) {
                     conditionMet = true;
                 }
@@ -2210,6 +2322,64 @@ private:
 };
 } // namespace
 
+// Has to cover everything execute() does that can end up in Lua: a command's
+// send and a sound's playback can raise events as well as the script can.
+bool TTrigger::fireReachesLua() const
+{
+    return mRegisteredAnonymousLuaFunction || !mScript.isEmpty() || !mCommand.isEmpty() || playsSound();
+}
+
+// The trigger editor and a package can both leave the sound box ticked with no
+// file named, and a blank name names no file in the profile's media directory,
+// which TMedia can only fail to play.
+bool TTrigger::playsSound() const
+{
+    return mSoundTrigger && !mSoundFile.trimmed().isEmpty();
+}
+
+// Only Lua reads a fire's captures, and handing them over and back costs more
+// than a fire that runs no script.
+// lineNumber is the line text patterns matched as it arrived, whose captures are moved
+// past what earlier triggers edited; -1 for positions in the line's current columns
+void TTrigger::executeWithCaptures(
+        const std::list<std::string>& captureList, const std::list<int>& posList, const int lineNumber, const NameGroupMatches* nameGroups, const QMap<QString, QPair<int, int>>* namePositions)
+{
+    if (!fireReachesLua()) {
+        execute();
+        return;
+    }
+    TLuaInterpreter* pL = mpHost->getLuaInterpreter();
+    const TConsoleModel* pModel = mpHost->mainConsoleModelOrNull();
+    const int arrivedLine = mPositionsInCurrentColumns ? -1 : lineNumber;
+    if (pModel && pModel->buffer.triggerPassLineEdited(arrivedLine)) {
+        std::list<int> positionsNow;
+        std::vector<int> lengthsNow;
+        lengthsNow.reserve(captureList.size());
+        auto capture = captureList.cbegin();
+        for (auto position = posList.cbegin(); position != posList.cend() && capture != captureList.cend(); ++position, ++capture) {
+            const auto [start, length] = pModel->buffer.triggerPassSpanNow(arrivedLine, *position, static_cast<int>(QString::fromStdString(*capture).size()));
+            positionsNow.push_back(start);
+            lengthsNow.push_back(length);
+        }
+        pL->setCaptureGroups(captureList, positionsNow);
+        pL->setCaptureGroupLengths(std::move(lengthsNow));
+        if (nameGroups && namePositions) {
+            QMap<QString, QPair<int, int>> namePositionsNow = *namePositions;
+            for (auto& range : namePositionsNow) {
+                std::tie(range.first, range.second) = pModel->buffer.triggerPassSpanNow(arrivedLine, range.first, range.second);
+            }
+            pL->setCaptureNameGroups(*nameGroups, namePositionsNow);
+        }
+    } else {
+        pL->setCaptureGroups(captureList, posList);
+        if (nameGroups && namePositions) {
+            pL->setCaptureNameGroups(*nameGroups, *namePositions);
+        }
+    }
+    execute();
+    pL->clearCaptureGroups();
+}
+
 void TTrigger::execute()
 {
     // Only root triggers carry a lineage, so a trigger nested in a folder or a
@@ -2223,7 +2393,7 @@ void TTrigger::execute()
     }
     const ExecutingTriggerGuard executingTriggerGuard(mpHost->getTriggerUnit(), &mName, pRoot->sameLineChainId(), pRoot->sameLineGeneration());
 
-    if (mSoundTrigger) { /* eventually something should be added to the gui to change sound volumes. 100=full volume */
+    if (playsSound()) { /* eventually something should be added to the gui to change sound volumes. 100=full volume */
         QString mediaFileName = mSoundFile;
 
         if (QDir::homePath().contains('\\')) {
@@ -2240,7 +2410,16 @@ void TTrigger::execute()
         mpHost->mpMedia->playMedia(mediaData);
     }
     if (!mCommand.isEmpty()) {
+        // Sending runs a whole alias pass, and any alias it matches empties the
+        // captures before this trigger's script has read them; "command" is left
+        // as that pass sets it. Only the script reads them back, so a trigger
+        // without one does not pay for parking them on the flood path.
+        const bool scriptReadsCaptures = mRegisteredAnonymousLuaFunction || !mScript.isEmpty();
+        const int dispatchDepth = scriptReadsCaptures ? mpLua->pushNestedDispatchState(false) : -1;
         mpHost->send(mCommand);
+        if (dispatchDepth >= 0) {
+            mpLua->popNestedDispatchState(dispatchDepth);
+        }
     }
     if (mNeedsToBeCompiled) {
         if (!compileScript()) {

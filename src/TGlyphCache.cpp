@@ -19,15 +19,31 @@
 
 #include "TGlyphCache.h"
 
+#include <QGlyphRun>
 #include <QGuiApplication>
 #include <QPaintDevice>
 #include <QPainter>
 #include <QRect>
 #include <QTextLayout>
 
+#include <algorithm>
+
+namespace {
+// At this size Qt stops blitting glyphs one by one from its glyph cache and
+// fills all of a call's glyphs as one path (QPaintEngineEx::shouldDrawCachedGlyphs),
+// which blends the edges where two glyphs meet once instead of twice.
+bool drawnAsOnePath(const QPainter& painter, const QRawFont& font)
+{
+    constexpr qreal maxCachedGlyphSize = 64;
+    const qreal pixelSize = font.pixelSize();
+    return pixelSize * pixelSize * qAbs(painter.deviceTransform().determinant()) > maxCachedGlyphSize * maxCachedGlyphSize;
+}
+} // namespace
+
 TGlyphCache::TGlyphCache()
 : mFontDatabaseConnection(QObject::connect(qGuiApp, &QGuiApplication::fontDatabaseChanged, [this]() {
     mEntries.clear();
+    mQueuedFont = QRawFont();
 }))
 {
 }
@@ -50,15 +66,8 @@ void TGlyphCache::setFont(const QFont& font, const QPaintDevice& device)
     mDpiY = dpiY;
 }
 
-void TGlyphCache::drawCentered(QPainter& painter, const QRect& cell, QStringView grapheme, const Style style)
+QPointF TGlyphCache::origin(const QRect& cell, const Entry& entry)
 {
-    Q_ASSERT_X(mDpiX > 0, "TGlyphCache::drawCentered(...)", "setFont() has not been called, so there is no font to shape with");
-    if (grapheme.isEmpty()) {
-        return;
-    }
-    const bool cacheable = grapheme.size() <= csmMaxCachedLength;
-    const Entry uncached = cacheable ? Entry() : shape(grapheme, style);
-    const Entry& entry = cacheable ? lookup(grapheme, style) : uncached;
     // The same centring qt_format_text() applies for Qt::AlignCenter, truncated
     // to the 1/64 pixel grid as QTextLine::draw() does before the painter's
     // scale is applied - otherwise glyphs land a device pixel away from where
@@ -66,23 +75,109 @@ void TGlyphCache::drawCentered(QPainter& painter, const QRect& cell, QStringView
     const auto toFixedGrid = [](const qreal value) {
         return static_cast<int>(value * 64) / 64.0;
     };
-    const QPointF origin(toFixedGrid(cell.x() + (cell.width() - entry.advance) / 2), toFixedGrid(cell.y() + (cell.height() - entry.height) / 2));
-    for (const QGlyphRun& run : entry.runs) {
-        painter.drawGlyphRun(origin, run);
+    return QPointF(toFixedGrid(cell.x() + (cell.width() - entry.advance) / 2), toFixedGrid(cell.y() + (cell.height() - entry.height) / 2));
+}
+
+qreal TGlyphCache::drawCentered(QPainter& painter, const QRect& cell, QStringView grapheme, const Style style)
+{
+    const qreal bottom = queueCentered(painter, cell, grapheme, style, painter.pen().color());
+    flush(painter);
+    return bottom;
+}
+
+qreal TGlyphCache::queueCentered(QPainter& painter, const QRect& cell, QStringView grapheme, const Style style, const QColor& color)
+{
+    Q_ASSERT_X(mDpiX > 0, "TGlyphCache::queueCentered(...)", "setFont() has not been called, so there is no font to shape with");
+    if (grapheme.isEmpty()) {
+        return cell.y();
     }
+    const bool cacheable = grapheme.size() <= csmMaxCachedLength;
+    const Entry uncached = cacheable ? Entry() : shape(grapheme, style);
+    const Entry& entry = cacheable ? lookup(grapheme, style) : uncached;
+    const QPointF at = origin(cell, entry);
+    for (const Run& run : entry.runs) {
+        // drawGlyphRun() hands every glyph of a call to one font engine
+        if (!mQueuedGlyphs.isEmpty() && (run.font != mQueuedFont || color != mQueuedColor)) {
+            flush(painter);
+        }
+        if (mQueuedGlyphs.isEmpty()) {
+            mQueuedFont = run.font;
+            mQueuedColor = color;
+        }
+        mQueuedGlyphs.append(run.glyphs);
+        // drawGlyphRun() adds its position argument to each of these, so with
+        // a zero position they have to carry the origin themselves; the sum is
+        // the one drawGlyphRun(origin, ...) would have worked out.
+        for (const QPointF& position : run.positions) {
+            mQueuedPositions.append(at + position);
+        }
+        if (drawnAsOnePath(painter, run.font)) {
+            flush(painter);
+        }
+    }
+    return at.y() + entry.inkBottom;
+}
+
+qreal TGlyphCache::inkBottom(const QRect& cell, QStringView grapheme, const Style style)
+{
+    if (grapheme.isEmpty()) {
+        return cell.y();
+    }
+    const bool cacheable = grapheme.size() <= csmMaxCachedLength;
+    const Entry uncached = cacheable ? Entry() : shape(grapheme, style);
+    const Entry& entry = cacheable ? lookup(grapheme, style) : uncached;
+    return origin(cell, entry).y() + entry.inkBottom;
+}
+
+void TGlyphCache::flush(QPainter& painter)
+{
+    if (mQueuedGlyphs.isEmpty()) {
+        return;
+    }
+    if (painter.pen().color() != mQueuedColor) {
+        painter.setPen(mQueuedColor);
+    }
+    // Raw data rather than setGlyphIndexes(), which would share the queue's
+    // buffers and so make the clear() below allocate new ones.
+    QGlyphRun run;
+    run.setRawFont(mQueuedFont);
+    run.setRawData(mQueuedGlyphs.constData(), mQueuedPositions.constData(), static_cast<int>(mQueuedGlyphs.size()));
+    painter.drawGlyphRun(QPointF(), run);
+    mQueuedGlyphs.clear();
+    mQueuedPositions.clear();
 }
 
 const TGlyphCache::Entry& TGlyphCache::lookup(QStringView grapheme, const Style style)
 {
     // Borrowing the caller's characters keeps a cache hit free of allocations.
     const Key probe{QString::fromRawData(grapheme.data(), grapheme.size()), style};
-    if (const auto it = mEntries.constFind(probe); it != mEntries.cend()) {
+    if (const auto it = mEntries.find(probe); it != mEntries.end()) {
+        it->lastUse = ++mUses;
         return *it;
     }
     if (mEntries.size() >= csmMaxEntries) {
-        mEntries.clear();
+        evictLeastRecentlyUsed();
     }
-    return *mEntries.insert(Key{grapheme.toString(), style}, shape(grapheme, style));
+    Entry entry = shape(grapheme, style);
+    entry.lastUse = ++mUses;
+    return *mEntries.insert(Key{grapheme.toString(), style}, std::move(entry));
+}
+
+void TGlyphCache::evictLeastRecentlyUsed()
+{
+    // Clearing everything instead would make a repertoire larger than the
+    // cache, as CJK text easily has, shape its common characters over and over.
+    QList<quint64> uses;
+    uses.reserve(mEntries.size());
+    for (const Entry& entry : std::as_const(mEntries)) {
+        uses.append(entry.lastUse);
+    }
+    const auto cut = uses.begin() + uses.size() / 4;
+    std::nth_element(uses.begin(), cut, uses.end());
+    const quint64 oldestKept = *cut;
+    mEntries.removeIf([oldestKept](const auto& it) {
+        return it.value().lastUse < oldestKept;
+    });
 }
 
 QFont TGlyphCache::styled(QFont font, const Style style)
@@ -130,10 +225,23 @@ TGlyphCache::Entry TGlyphCache::shape(QStringView grapheme, const Style style) c
     if (!line.isValid()) {
         return entry;
     }
-    entry.runs = layout.glyphRuns();
+    for (const QGlyphRun& glyphRun : layout.glyphRuns()) {
+        Run run{glyphRun.rawFont(), glyphRun.glyphIndexes(), glyphRun.positions()};
+        // flush() pairs queued glyphs and positions by index, so they must stay
+        // the same length; drawGlyphRun() would have stopped at the shorter one.
+        const qsizetype count = std::min(run.glyphs.size(), run.positions.size());
+        run.glyphs.resize(count);
+        run.positions.resize(count);
+        entry.runs.append(std::move(run));
+    }
     entry.advance = line.horizontalAdvance();
     // Not line.height(), which is rounded up and would lift glyphs above where
     // drawText() puts them.
     entry.height = line.ascent() + line.descent();
+    for (const Run& run : std::as_const(entry.runs)) {
+        for (qsizetype i = 0; i < run.glyphs.size(); ++i) {
+            entry.inkBottom = std::max(entry.inkBottom, run.positions.at(i).y() + run.font.boundingRect(run.glyphs.at(i)).bottom());
+        }
+    }
     return entry;
 }

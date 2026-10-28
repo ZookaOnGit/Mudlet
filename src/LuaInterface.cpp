@@ -26,7 +26,10 @@
 #include "VarUnit.h"
 #include "utils.h"
 
+#include <cmath>
 #include <csetjmp>
+#include <limits>
+#include <optional>
 
 extern "C" {
 #if defined(INCLUDE_VERSIONED_LUA_HEADERS)
@@ -41,6 +44,27 @@ extern "C" {
 }
 
 static jmp_buf buf;
+
+// lua_tostring() writes %.14g, which does not round-trip every double;
+// adding digits only until it does keeps a number like 0.1 written as 0.1.
+static QString numberToText(const lua_Number number)
+{
+    // QString::number() writes -0 as "0", and a NaN never equals what it reads back as
+    if (number == 0) {
+        return std::signbit(number) ? qsl("-0") : qsl("0");
+    }
+    if (std::isnan(number)) {
+        return qsl("nan");
+    }
+    QString text;
+    for (int precision = 14; precision <= 17; ++precision) {
+        text = QString::number(number, 'g', precision);
+        if (text.toDouble() == number) {
+            break;
+        }
+    }
+    return text;
+}
 
 LuaInterface::LuaInterface(lua_State* L)
 : mL(L)
@@ -93,6 +117,30 @@ std::pair<bool, QString> LuaInterface::validMove(TVar* pNewParent) const
     return {true, QString()};
 }
 
+// Lua saves numbers with printf, so a save holds whichever NaN/infinity spelling its platform uses;
+// toDouble() reads only "nan", "inf" and "-inf", not glibc's "-nan", UCRT's "-nan(ind)" or msvcrt's "1.#INF".
+static std::optional<lua_Number> numberFromText(const QString& text)
+{
+    bool ok = false;
+    const double number = text.toDouble(&ok);
+    if (ok) {
+        return number;
+    }
+    const QString spelling = text.trimmed();
+    static const QStringList nanSpellings{
+            qsl("-nan"), qsl("nan(ind)"), qsl("-nan(ind)"), qsl("nan(snan)"), qsl("-nan(snan)"), qsl("1.#QNAN"), qsl("-1.#QNAN"), qsl("1.#IND"), qsl("-1.#IND"), qsl("1.#SNAN"), qsl("-1.#SNAN")};
+    if (nanSpellings.contains(spelling, Qt::CaseInsensitive)) {
+        return std::numeric_limits<lua_Number>::quiet_NaN();
+    }
+    if (spelling.compare(qsl("1.#INF"), Qt::CaseInsensitive) == 0) {
+        return std::numeric_limits<lua_Number>::infinity();
+    }
+    if (spelling.compare(qsl("-1.#INF"), Qt::CaseInsensitive) == 0) {
+        return -std::numeric_limits<lua_Number>::infinity();
+    }
+    return std::nullopt;
+}
+
 bool LuaInterface::loadKey(lua_State* L, TVar* var)
 {
     if (setjmp(buf) == 0) {
@@ -101,7 +149,7 @@ bool LuaInterface::loadKey(lua_State* L, TVar* var)
             lua_rawgeti(L, LUA_REGISTRYINDEX, var->getName().toInt());
         } else {
             if (keyType == LUA_TNUMBER) {
-                lua_pushnumber(L, var->getName().toDouble());
+                lua_pushnumber(L, numberFromText(var->getName()).value_or(0));
             } else if (keyType == LUA_TTABLE) {
             } else if (keyType == LUA_TBOOLEAN) {
                 lua_pushboolean(L, var->getName().toLower() == "true" ? 1 : 0);
@@ -343,7 +391,7 @@ bool LuaInterface::pushKey(TVar* var, const QString& name, const int keyType)
         return true;
     }
     if (keyType == LUA_TNUMBER) {
-        lua_pushnumber(mL, name.toDouble());
+        lua_pushnumber(mL, numberFromText(name).value_or(0));
         return true;
     }
     if (keyType == LUA_TBOOLEAN) {
@@ -409,15 +457,23 @@ bool LuaInterface::setValue(TVar* var)
             lua_settop(mL, stackTop);
             return false;
         }
+        if (var->getKeyType() == LUA_TNUMBER && !var->isReference() && !numberFromText(var->getName())) {
+            qWarning().noquote().nospace() << "LuaInterface::setValue(...) WARNING - the key \"" << var->getName() << "\" is not a number, so it is being written as the key 0.";
+        }
         switch (var->getValueType()) {
         case LUA_TSTRING: {
             const QByteArray value = var->getValue().toUtf8();
             lua_pushlstring(mL, value.constData(), value.length());
             break;
         }
-        case LUA_TNUMBER:
-            lua_pushnumber(mL, var->getValue().toDouble());
+        case LUA_TNUMBER: {
+            const std::optional<lua_Number> number = numberFromText(var->getValue());
+            if (!number) {
+                qWarning().noquote().nospace() << "LuaInterface::setValue(...) WARNING - \"" << var->getValue() << "\" is not a number, so \"" << var->getName() << "\" is being set to 0.";
+            }
+            lua_pushnumber(mL, number.value_or(0));
             break;
+        }
         case LUA_TBOOLEAN:
             lua_pushboolean(mL, var->getValue().toLower() == QLatin1String("true") ? 1 : 0);
             break;
@@ -627,7 +683,7 @@ QString LuaInterface::getValue(TVar* var)
         if (firstVariable->getKeyType() == LUA_TSTRING) {
             lua_getglobal(mL, (firstVariable->getName()).toUtf8().constData());
         } else if (firstVariable->getKeyType() == LUA_TNUMBER) {
-            lua_pushnumber(mL, firstVariable->getName().toDouble());
+            lua_pushnumber(mL, numberFromText(firstVariable->getName()).value_or(0));
             lua_gettable(mL, LUA_GLOBALSINDEX);
         } else if (firstVariable->getKeyType() == LUA_TBOOLEAN) {
             lua_pushboolean(mL, firstVariable->getName().toLower() == "true" ? 1 : 0);
@@ -656,7 +712,9 @@ QString LuaInterface::getValue(TVar* var)
         QString value;
         if (valueType == LUA_TBOOLEAN) {
             value = lua_toboolean(mL, -1) == 0 ? QLatin1String("false") : QLatin1String("true");
-        } else if (valueType == LUA_TNUMBER || valueType == LUA_TSTRING) {
+        } else if (valueType == LUA_TNUMBER) {
+            value = numberToText(lua_tonumber(mL, -1));
+        } else if (valueType == LUA_TSTRING) {
             value = lua_tostring(mL, -1);
         }
         lua_settop(mL, entryTop);
@@ -673,6 +731,29 @@ QString LuaInterface::getValue(TVar* var)
 static bool serializableValueType(const int valueType)
 {
     return valueType == LUA_TTABLE || valueType == LUA_TSTRING || valueType == LUA_TNUMBER || valueType == LUA_TBOOLEAN;
+}
+
+// Whether a saved-variables walk should write out a table it has already
+// written once in this saved global, under the name it has just reached it by.
+// The table at -1 is the one in question. Not when the name leads back to a
+// table the walk is inside, which would never end; nor for an object (a table
+// with a metatable), which no save brings back as one and whose copies the UI
+// objects packages keep in saved tables multiply out of all proportion (#9762);
+// nor once this global's copies run past scmMaxAliasCopyNodes, as tables shared
+// at every level double with each level.
+bool LuaInterface::savedWalkCanCopyAlias(lua_State* L, const void* pKey, const void* pValue, const int valueType)
+{
+    if (valueType != LUA_TTABLE || varUnit->pointerSeen(pKey) || mSavedWalkPath.contains(pValue)) {
+        return false;
+    }
+    if (mAliasCopyNodes >= scmMaxAliasCopyNodes) {
+        return false;
+    }
+    if (lua_getmetatable(L, -1)) {
+        lua_pop(L, 1);
+        return false;
+    }
+    return true;
 }
 
 void LuaInterface::iterateTable(lua_State* L, int index, TVar* tVar, bool hide)
@@ -725,6 +806,7 @@ void LuaInterface::iterateTable(lua_State* L, int index, TVar* tVar, bool hide)
                 // each saved global is walked in its own dedup scope, so two of them
                 // that reference the same table both get a complete subtree
                 varUnit->clearPointers();
+                mAliasCopyNodes = 0;
                 mCurrentSavedRootName = keyName;
             } else if (!serializableValueType(vType)) {
                 // the whole global, not just the table this value sits in: a
@@ -750,11 +832,24 @@ void LuaInterface::iterateTable(lua_State* L, int index, TVar* tVar, bool hide)
         // Mudlet's own API - but a saved variable reached second would be left
         // with no node to export from, so it is exempt (#9755). _G reaches
         // itself, hence the name test.
-        if (keyName == qsl("_G") || (varUnit->varExists(var) && !varUnit->isSaved(var))) {
+        bool skip = keyName == qsl("_G") || (varUnit->varExists(var) && !varUnit->isSaved(var));
+        bool aliasCopy = false;
+        if (skip && mSavedVarsOnly && keyName != qsl("_G") && savedWalkCanCopyAlias(L, pKey, pValue, vType)) {
+            // the XML can only hold a second name for a plain table as a second
+            // copy, and leaving it out loses it from the save (#10721)
+            skip = false;
+            aliasCopy = true;
+        }
+        if (skip) {
             lua_pop(L, 1);
             tVar->removeChild(var);
             delete var;
             continue;
+        }
+        var->aliasCopy = aliasCopy && mAliasCopyDepth == 0;
+        if (mSavedVarsOnly && (aliasCopy || mAliasCopyDepth > 0) && ++mAliasCopyNodes == scmMaxAliasCopyNodes) {
+            qWarning().noquote().nospace() << "LuaInterface::iterateTable() WARNING - the saved variable \"" << mCurrentSavedRootName
+                                           << "\" names the same tables so many times that only the first name for each of the rest is saved.";
         }
         varUnit->addVariable(var);
 
@@ -773,10 +868,18 @@ void LuaInterface::iterateTable(lua_State* L, int index, TVar* tVar, bool hide)
             if (!tooDeep && lua_checkstack(L, 3)) {
                 //put the table on top
                 lua_pushnil(L);
+                if (mSavedVarsOnly) {
+                    mSavedWalkPath.append(pValue);
+                    mAliasCopyDepth += aliasCopy ? 1 : 0;
+                }
                 iterateTable(L, -2, var, hide);
                 depth--;
+                if (mSavedVarsOnly) {
+                    mSavedWalkPath.removeLast();
+                    mAliasCopyDepth -= aliasCopy ? 1 : 0;
+                }
             } else {
-                const QString variableName = varUnit->shortVarName(var).join(qsl("."));
+                const QString variableName = varUnit->shortVarPath(var);
                 qWarning().noquote().nospace() << "LuaInterface::iterateTable() WARNING - not reading the contents of the table \"" << variableName
                                                << "\": " << (tooDeep ? qsl("it is nested more than %1 tables deep").arg(scmMaxTableDepth) : qsl("the Lua stack could not be grown"))
                                                << ". It is being treated as an empty table.";
@@ -784,7 +887,9 @@ void LuaInterface::iterateTable(lua_State* L, int index, TVar* tVar, bool hide)
                     mTruncatedSavedTables.append(variableName);
                 }
             }
-        } else if (vType == LUA_TSTRING || vType == LUA_TNUMBER) {
+        } else if (vType == LUA_TNUMBER) {
+            var->setValue(numberToText(lua_tonumber(L, -1)));
+        } else if (vType == LUA_TSTRING) {
             lua_pushvalue(L, -1);
             valueName = lua_tostring(L, -1);
             var->setValue(valueName);
@@ -799,7 +904,6 @@ void LuaInterface::iterateTable(lua_State* L, int index, TVar* tVar, bool hide)
             var->setValue("function");
         } else {
             tVar->removeChild(var);
-            varUnit->removeVariable(var);
             delete var;
         }
         lua_pop(L, 1);
@@ -932,6 +1036,9 @@ bool LuaInterface::readSavedVars()
     mTruncatedSavedTables.clear();
     mSavedRootsHoldingUnsaveableValues.clear();
     mCurrentSavedRootName.clear();
+    // a panic jumps out of the walk without unwinding these
+    mSavedWalkPath.clear();
+    mAliasCopyDepth = 0;
     resetVariableTree();
     lua_pushnil(mL);
     iterateTable(mL, LUA_GLOBALSINDEX, varUnit->getBase(), false);
