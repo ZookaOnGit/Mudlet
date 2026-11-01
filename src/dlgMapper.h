@@ -49,6 +49,7 @@ class dlgMapper : public QWidget, public Ui::mapper, public TMapViewFrontend
 public:
     Q_DISABLE_COPY(dlgMapper)
     dlgMapper(QWidget*, Host*, TMap*);
+    Host* getHost() const { return mpHost; }
 #if defined(INCLUDE_3DMAPPER)
     QOpenGLWidget* glWidget = nullptr;
 #endif
@@ -74,7 +75,11 @@ public:
     void setMapProgressCancelable(bool cancelable) override;
     void hideMapProgress() override;
     bool isMapProgressVisible() const override;
-    void show3DView(bool shown) override { slot_toggle3DView(shown); }
+    std::pair<bool, QString> show3DView(bool shown) override
+    {
+        slot_toggle3DView(shown);
+        return {true, QString()};
+    }
     bool showing3DView() const override;
     void recreate3DView() override { recreate3DWidget(); }
     std::pair<bool, QString> shift3DViewCamera(float verticalAngle, float horizontalAngle, float rotationAngle) override;

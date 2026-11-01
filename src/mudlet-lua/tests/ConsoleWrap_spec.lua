@@ -117,6 +117,26 @@ describe("Tests how a console wraps the lines it is given", function()
       assert.are.equal("bbbb cccc ", out[2])
     end)
 
+    -- what getLines() reads back already carries the indents, and fits
+    it("echoes the lines of a wrapped line back unchanged", function()
+      for _, text in ipairs({"the quick brown fox jumps over the lazy dog", "thé quick brown fox jumps over the lazy dog"}) do
+        local first = wrapped(20, text, 4, 2)
+        clearWindow(win)
+        for _, line in ipairs(first) do
+          echo(win, line .. "\n")
+        end
+        assert.are.same(first, lines())
+      end
+    end)
+
+    it("breaks a line whose spaces run on past the room left beside the indent", function()
+      assert.are.same({"    aaaaaaaaaaaaaaaa", "b"}, wrapped(20, "aaaaaaaaaaaaaaaa     b", 4, 0))
+    end)
+
+    it("leaves a line that fits the width but for its trailing spaces alone", function()
+      assert.are.same({"aaaaaaaaaaaaaaaaaaaa   "}, wrapped(20, "aaaaaaaaaaaaaaaaaaaa   ", 4, 0))
+    end)
+
     it("ignores a wrap indent as wide as the window", function()
       -- an indent with no room left for text would wrap a line into single
       -- characters, so it is dropped instead
@@ -165,6 +185,81 @@ describe("Tests how a console wraps the lines it is given", function()
       setWindowWrap(win, 10)
       wrapLine(win, 0)
       assert.are.same({"aaaa bbbb ", "cccc dddd ", "eeee"}, lines())
+    end)
+
+    -- the first line exactly fills the width, indent included, so measuring it
+    -- as though the indent were still to come would break it again
+    local alphabetWrapped = {"  abcdefghij", "    klmnopqr", "    stuvwxyz"}
+
+    it("leaves an indented line alone when wrapLine() rewraps it at the same width", function()
+      assert.are.same(alphabetWrapped, wrapped(12, "abcdefghijklmnopqrstuvwxyz", 2, 4))
+      wrapLine(win, 0)
+      assert.are.same(alphabetWrapped, lines())
+      wrapLine(win, 0)
+      assert.are.same(alphabetWrapped, lines())
+    end)
+
+    it("leaves an indented line that is not plain ASCII alone when wrapLine() rewraps it at the same width", function()
+      local accented = {"  abcdéfghij", "    klmnopqr", "    stuvwxyz"}
+      assert.are.same(accented, wrapped(12, "abcdéfghijklmnopqrstuvwxyz", 2, 4))
+      wrapLine(win, 0)
+      assert.are.same(accented, lines())
+    end)
+
+    it("indents an already indented line once when wrapLine() rewraps it narrower", function()
+      wrapped(12, "abcdefghijklmnopqrstuvwxyz", 2, 4)
+      setWindowWrap(win, 8)
+      wrapLine(win, 0)
+      assert.are.same({"  abcdef", "    ghij", "    klmn", "    opqr", "    stuv", "    wxyz"}, lines())
+    end)
+
+    it("indents an already indented line once when a newline is inserted into it", function()
+      wrapped(12, "abcdefghijklmnopqrstuvwxyz", 2, 4)
+      moveCursor(win, 5, 0)
+      insertText(win, "\n")
+      assert.are.same({"  abc", "defghij", "    klmnopqr", "    stuvwxyz"}, lines())
+    end)
+
+    it("indents the line a newline inserted into a wrapped line starts when wrapLine() breaks it", function()
+      wrapped(12, "abcdefghijklmnopqrstuvwxyz", 2, 4)
+      moveCursor(win, 5, 0)
+      insertText(win, "\n")
+      setWindowWrap(win, 5)
+      wrapLine(win, 1)
+      assert.are.equal("  def", lines()[2])
+    end)
+
+    it("indents the line a newline inserted into a wrapped line starts when that line begins with spaces", function()
+      wrapped(12, "abcdefghijklmnopqrstuvwxyz", 2, 4)
+      moveCursor(win, 5, 0)
+      insertText(win, "\n  ")
+      setWindowWrap(win, 8)
+      wrapLine(win, 1)
+      local result = lines()
+      -- the spaces are text, so it wraps as that text echoed as a paragraph of its own does
+      local fresh = wrapped(8, "  defghij", 2, 4)
+      assert.are.same(fresh, {select(2, unpack(result, 1, #fresh + 1))})
+    end)
+
+    it("indents an already indented line once when wrapLine() rewraps it narrower after its continuation lines were deleted", function()
+      wrapped(12, "abcdefghijklmnopqrstuvwxyz", 2, 4)
+      moveCursor(win, 0, 1)
+      deleteLine(win)
+      moveCursor(win, 0, 1)
+      deleteLine(win)
+      setWindowWrap(win, 8)
+      wrapLine(win, 0)
+      assert.are.same({"  abcdef", "    ghij"}, lines())
+    end)
+
+    it("leaves the indented lines below alone when a newline is inserted above them", function()
+      wrapAt(12, 2, 4)
+      echo(win, "one\n")
+      echo(win, "abcdefghijklmnopqrstuvwxyz\n")
+      moveCursor(win, 3, 0)
+      insertText(win, "\ntwo")
+      local result = lines()
+      assert.are.same(alphabetWrapped, {select(3, unpack(result))})
     end)
 
     -- Wider than the main console's own width, so a rewrap at that width shows
@@ -270,11 +365,18 @@ describe("Tests how a console wraps the lines it is given", function()
       return out
     end
 
-    it("wraps a line that fits the width but not the width less the indent", function()
+    it("leaves a line that fits the width but not the width less the indent alone", function()
       setWindowWrap("main", 20)
       setWindowWrapIndent("main", 4)
       feedTriggers("\naaaaaaaaaaaaaa bbbbb\n")
-      assert.are.same({"    aaaaaaaaaaaaaa ", "bbbbb"}, lastLines(2))
+      assert.are.same({"aaaaaaaaaaaaaa bbbbb"}, lastLines(1))
+    end)
+
+    it("indents a line one column wider than the width", function()
+      setWindowWrap("main", 20)
+      setWindowWrapIndent("main", 4)
+      feedTriggers("\naaaaaaaaaaaaaa bbbbbb\n")
+      assert.are.same({"    aaaaaaaaaaaaaa ", "bbbbbb"}, lastLines(2))
     end)
 
     it("leaves a line that fits the width less the indent alone", function()
