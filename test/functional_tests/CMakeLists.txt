@@ -220,6 +220,7 @@ set(EDITOR_GROUP_TEST_SOURCES
     EditorAddItemTest.cpp
     EditorFolderViewTest.cpp
     EditorFontTest.cpp
+    EditorModuleFolderTest.cpp
     EditorSearchTest.cpp
     TreeWidgetItemMoveTest.cpp
     TriggerEditorDisclosureTest.cpp
@@ -232,6 +233,7 @@ set(EDITOR_GROUP_TEST_SOURCES
 # The map: its rooms and areas, its file format, and the mapper widget
 set(MAP_GROUP_TEST_SOURCES
     EmbeddedMapperCreationTest.cpp
+    FloatingMapKeyBindingTest.cpp
     ExitAppearanceTest.cpp
     MapAreaReassignmentTest.cpp
     MapAreaSelectionTest.cpp
@@ -488,7 +490,8 @@ add_test(NAME HeadlessHostSmokeTestWithDiscordLibrary
         test_aSecondPoolLeavesNoDiscordDataBehind
         test_aSecondPoolForgetsDiscordDataAfterEveryExitEvent
         test_deleteHostForgetsDiscordDataOfAProfileReopenedUnderItsExitHandler
-        test_aSecondPoolForgetsDiscordDataOfAProfileReopenedUnderItsExitHandler)
+        test_aSecondPoolForgetsDiscordDataOfAProfileReopenedUnderItsExitHandler
+        test_aProfileBroughtForwardStartsItsDiscordPresenceWithNoMainWindow)
 list(APPEND allFunctionalTestNames HeadlessHostSmokeTestWithDiscordLibrary)
 # HeadlessHostSmokeTest runs with no Mudlet.ini, so its tests see the defaults. Its Mudlet.ini case runs
 # again in a process of its own, where one is written before anything reads it: the trigger match pool

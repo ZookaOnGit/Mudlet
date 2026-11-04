@@ -82,7 +82,7 @@ bool HostManager::releasingProfile()
     return sReleasesPending > 0;
 }
 
-HostManager::HostManager(const ConfigRoot configRoot)
+HostManager::HostManager(const ConfigRoot configRoot, const QString& configDir)
 : mpMedia(std::make_unique<MudletMedia>())
 , mpFonts(std::make_unique<FontManager>())
 , mpReplay(std::make_unique<MudletReplay>())
@@ -91,7 +91,11 @@ HostManager::HostManager(const ConfigRoot configRoot)
 {
     // Settling again would delete the settings store under whoever holds it
     if (configRoot == ConfigRoot::settledHere && !MudletApp::configRootSettled()) {
-        MudletApp::settleConfigRoot();
+        if (configDir.isEmpty()) {
+            MudletApp::settleConfigRoot();
+        } else {
+            MudletApp::chooseConfigRoot(configDir);
+        }
         // Once per process: where the main window settles the root, its readEarlySettings() and readLateSettings()
         // read them instead
         const QSettings& settings = *MudletApp::getQSettings();
@@ -256,8 +260,11 @@ Host* HostManager::openProfile(const QString& name, const bool connect, const st
 }
 
 // The packages the GUI installs into a profile on its first load, for its game
-QStringList HostManager::defaultPackages(const QString& gameUrl, const QString& profileName, const bool serverGuiAccepted)
+QStringList HostManager::defaultPackages(const QString& address, const QString& profileName, const bool serverGuiAccepted)
 {
+    // A catalog game's are chosen for the game, not for another address the player saved for it
+    const auto game = TGameDetails::findGame(profileName);
+    const QString gameUrl = game != TGameDetails::scmDefaultGames.end() ? (*game).hostUrl.toLower() : address;
     QStringList packages;
     const QHash<QString, QStringList> defaultScripts = {
             // clang-format off

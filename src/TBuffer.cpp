@@ -390,11 +390,29 @@ constexpr size_t MAX_CSI_SEQUENCE_LENGTH = 4096;
 // Inline room for any SGR parameter string a game actually sends, avoiding the heap:
 constexpr qsizetype SGR_INLINE_CHARS = 64;
 
-// Helper to interpret JSON values as boolean
-// Accepts both boolean true and numeric non-zero values (servers may send 1 instead of true)
-bool jsonBoolValue(const QJsonValue& val)
+// Some MUD drivers have no JSON boolean to send, so the forms Char.Login 2 accepts count too: "true"/"false"
+// and "1"/"0" in any letter case, ignoring surrounding whitespace, and the numbers 1/0. Anything else is nullopt.
+std::optional<bool> jsonBoolValue(const QJsonValue& val)
 {
-    return val.toBool() || (val.isDouble() && val.toDouble() != 0);
+    if (val.isBool()) {
+        return val.toBool();
+    }
+    if (val.isDouble()) {
+        const double number = val.toDouble();
+        if (number == 0 || number == 1) {
+            return number == 1;
+        }
+    }
+    if (val.isString()) {
+        const QString text = val.toString().trimmed().toLower();
+        if (text == qsl("true") || text == qsl("1")) {
+            return true;
+        }
+        if (text == qsl("false") || text == qsl("0")) {
+            return false;
+        }
+    }
+    return std::nullopt;
 }
 
 // One parameter of an OSC 8 URI query, kept exactly as it arrived. The styling parser decodes
@@ -856,6 +874,7 @@ TBuffer::TBuffer(const TBuffer& other)
 , mBackGroundColor(other.mBackGroundColor)
 , mpHost(other.mpHost)
 , mBold(other.mBold)
+, mBoldAsked(other.mBoldAsked)
 , mItalics(other.mItalics)
 , mOverline(other.mOverline)
 , mReverse(other.mReverse)
@@ -898,6 +917,7 @@ TBuffer::TBuffer(const TBuffer& other)
 , mCurrentHyperlinkHint(other.mCurrentHyperlinkHint)
 , mCurrentHyperlinkLinkId(other.mCurrentHyperlinkLinkId)
 , mHyperlinkActive(other.mHyperlinkActive)
+, mHyperlinkEnclosingMxpLinkId(other.mHyperlinkEnclosingMxpLinkId)
 , mWatchdogPhase(other.mWatchdogPhase)
 , mTagWatchdog(std::make_unique<QTimer>())
 , mWatchdogTagSnapshot(other.mWatchdogTagSnapshot)
@@ -966,6 +986,7 @@ TBuffer& TBuffer::operator=(const TBuffer& other)
         mBackGroundColor = other.mBackGroundColor;
         mpHost = other.mpHost;
         mBold = other.mBold;
+        mBoldAsked = other.mBoldAsked;
         mItalics = other.mItalics;
         mOverline = other.mOverline;
         mReverse = other.mReverse;
@@ -1008,6 +1029,7 @@ TBuffer& TBuffer::operator=(const TBuffer& other)
         mCurrentHyperlinkHint = other.mCurrentHyperlinkHint;
         mCurrentHyperlinkLinkId = other.mCurrentHyperlinkLinkId;
         mHyperlinkActive = other.mHyperlinkActive;
+        mHyperlinkEnclosingMxpLinkId = other.mHyperlinkEnclosingMxpLinkId;
         mWatchdogPhase = other.mWatchdogPhase;
         mWatchdogTagSnapshot = other.mWatchdogTagSnapshot;
         mCurrentHyperlinkStyling = other.mCurrentHyperlinkStyling;
@@ -2463,6 +2485,7 @@ TBuffer::ParseState TBuffer::parseState() const
     state.gotString = mGotString;
     state.isDefaultColor = mIsDefaultColor;
     state.bold = mBold;
+    state.boldAsked = mBoldAsked;
     state.italics = mItalics;
     state.overline = mOverline;
     state.reverse = mReverse;
@@ -2485,7 +2508,7 @@ bool TBuffer::parseStateIs(const ParseState& state) const
            && mUnderline == state.underline && mUnderlineWavy == state.underlineWavy && mUnderlineDotted == state.underlineDotted && mUnderlineDashed == state.underlineDashed && mBlink == state.blink
            && mFastBlink == state.fastBlink && mConcealed == state.concealed && mHyperlinkActive == state.hyperlinkActive && mAltFont == state.altFont && mPendingLead == state.pendingLead
            && mDecoder == state.decoder && mIncompleteSequenceBytes == state.incompleteSequenceBytes && mForeGroundColor == state.foreground && mForeGroundColorLight == state.foregroundLight
-           && mBackGroundColor == state.background && mPendingLeadFormat == state.pendingLeadFormat;
+           && mBackGroundColor == state.background && mPendingLeadFormat == state.pendingLeadFormat && mBoldAsked == state.boldAsked;
 }
 
 void TBuffer::setParseState(const ParseState& state)
@@ -2505,6 +2528,7 @@ void TBuffer::setParseState(const ParseState& state)
     mGotString = state.gotString;
     mIsDefaultColor = state.isDefaultColor;
     mBold = state.bold;
+    mBoldAsked = state.boldAsked;
     mItalics = state.italics;
     mOverline = state.overline;
     mReverse = state.reverse;
@@ -2721,6 +2745,7 @@ void TBuffer::resetCurrentTextFormat()
     mForeGroundColorLight = mpHost->mFgColor;
     mBackGroundColor = mpHost->mBgColor;
     mBold = false;
+    mBoldAsked = false;
     mItalics = false;
     mOverline = false;
     mReverse = false;
@@ -3591,7 +3616,7 @@ TChar::AttributeFlags TBuffer::computeCurrentAttributeFlags() const
            | (mOverline ? TChar::Overline : TChar::None) | (mReverse ? TChar::Reverse : TChar::None) | (mStrikeOut || mxpClientStrikeOut() ? TChar::StrikeOut : TChar::None)
            | (mUnderline || mxpClientUnderline() ? TChar::Underline : TChar::None) | (mUnderlineWavy ? TChar::UnderlineWavy : TChar::None) | (mUnderlineDotted ? TChar::UnderlineDotted : TChar::None)
            | (mUnderlineDashed ? TChar::UnderlineDashed : TChar::None) | (mFastBlink ? TChar::FastBlink : (mBlink ? TChar::Blink : TChar::None)) | (TChar::alternateFontFlag(mAltFont))
-           | (mConcealed ? TChar::Concealed : TChar::None);
+           | (mConcealed ? TChar::Concealed : TChar::None) | (mBoldAsked || mxpClientBold() ? TChar::BoldAsked : TChar::None);
 }
 
 void TBuffer::decodeSGR38(const SgrParameters& parameters, bool isColonSeparated)
@@ -4273,6 +4298,7 @@ void TBuffer::decodeSGR(const QStringView sequence)
                     mForeGroundColor = hostForeground();
                     mBackGroundColor = hostBackground();
                     mBold = false;
+                    mBoldAsked = false;
                     mItalics = false;
                     mOverline = false;
                     mReverse = false;
@@ -4288,12 +4314,14 @@ void TBuffer::decodeSGR(const QStringView sequence)
                     break;
                 case 1:
                     mBold = true;
+                    mBoldAsked = true;
                     break;
                 case 2:
                     // Technically this should be faint (i.e. decreased
                     // intensity compared to normal and 22 should be
                     // the reset to "normal" intensity):
                     mBold = false;
+                    mBoldAsked = false;
                     break;
                 case 3:
                     // There is a proposal by the "VTE" terminal
@@ -4370,6 +4398,7 @@ void TBuffer::decodeSGR(const QStringView sequence)
                 //    break;
                 case 22:
                     mBold = false;
+                    mBoldAsked = false;
                     break;
                 case 23:
                     mItalics = false;
@@ -4980,28 +5009,13 @@ void TBuffer::decodeOSC(const QString& sequence)
 #endif
             // Reset styling to defaults before parsing
             mCurrentHyperlinkStyling = Mudlet::HyperlinkStyling();
+            mCurrentHyperlinkMenu.clear();
             QMap<QString, QString> queryParams;
             parseUriQueryParameters(rawUrl, mCurrentHyperlinkStyling, queryParams);
 
 #if defined(DEBUG_OSC_PROCESSING)
             qDebug() << "[OSC] Styling parsed directly from JSON (isUnderlined=" << mCurrentHyperlinkStyling.isUnderlined << ")";
 #endif
-
-            // Extract menu parameters
-            if (queryParams.contains(qsl("menu"))) {
-                QString menuString = queryParams.value(qsl("menu"));
-                mCurrentHyperlinkMenu = menuString.split('|', Qt::SkipEmptyParts);
-#if defined(DEBUG_OSC_PROCESSING)
-                qDebug() << "[OSC] Menu parameter found:" << menuString;
-                qDebug() << "[OSC] Menu items parsed:" << mCurrentHyperlinkMenu;
-                qDebug() << "[OSC] Menu items count:" << mCurrentHyperlinkMenu.size();
-#endif
-            } else {
-                mCurrentHyperlinkMenu.clear();
-#if defined(DEBUG_OSC_PROCESSING)
-                qDebug() << "[OSC] No menu parameter found";
-#endif
-            }
 
             // Extract custom tooltip parameter
             QString customTooltip;
@@ -5190,6 +5204,7 @@ void TBuffer::decodeOSC(const QString& sequence)
             qDebug().noquote() << "[OSC] Hyperlink activated:" << rawUrl.left(50) + (rawUrl.length() > 50 ? "..." : "");
 #endif
             mHyperlinkActive = true;
+            mHyperlinkEnclosingMxpLinkId = (!mpParseConfig && mpHost->mMxpClient.isInLinkMode()) ? mpHost->mMxpClient.linkId() : 0;
 
             // Record start position for visibility manager registration
             // Use mMudLine.length() since that's where link text will be added
@@ -5441,13 +5456,12 @@ bool TBuffer::parseJsonHyperlinkConfig(const QString& jsonString, QMap<QString, 
 
     if (root.contains(qsl("menu")) && root[qsl("menu")].isArray()) {
         QJsonArray menuArray = root[qsl("menu")].toArray();
-        QString menuString = jsonMenuArrayToString(menuArray);
-        if (!menuString.isEmpty()) {
-            parameters.insert(qsl("menu"), menuString);
+        mCurrentHyperlinkMenu = jsonMenuArrayToList(menuArray);
+        if (!mCurrentHyperlinkMenu.isEmpty()) {
             // Enable custom styling for links with menus
             styling.hasCustomStyling = true;
 #if defined(DEBUG_OSC_PROCESSING)
-            qDebug() << "[OSC] Menu parameter added:" << menuString;
+            qDebug() << "[OSC] Menu items:" << mCurrentHyperlinkMenu;
 #endif
         }
     }
@@ -5502,7 +5516,7 @@ bool TBuffer::parseJsonHyperlinkConfig(const QString& jsonString, QMap<QString, 
     }
 
     if (root.contains(qsl("spoiler"))) {
-        styling.isSpoiler = jsonBoolValue(root[qsl("spoiler")]);
+        styling.isSpoiler = jsonBoolValue(root[qsl("spoiler")]).value_or(styling.isSpoiler);
         if (styling.isSpoiler) {
             styling.hasCustomStyling = true;
 
@@ -5537,13 +5551,13 @@ bool TBuffer::parseJsonHyperlinkConfig(const QString& jsonString, QMap<QString, 
     }
 
     if (root.contains(qsl("disabled"))) {
-        styling.selection.disabled = jsonBoolValue(root[qsl("disabled")]);
-        if (styling.selection.disabled) {
-            styling.hasCustomStyling = true;
-        }
+        styling.selection.disabled = styling.selection.disabled || jsonBoolValue(root[qsl("disabled")]).value_or(false);
 #if defined(DEBUG_OSC_PROCESSING)
         qDebug() << "[OSC] Disabled config parsed from JSON:" << styling.selection.disabled;
 #endif
+    }
+    if (styling.selection.disabled) {
+        styling.hasCustomStyling = true;
     }
 
     if (styling.isSpoiler) {
@@ -5569,26 +5583,27 @@ bool TBuffer::parseJsonHyperlinkConfig(const QString& jsonString, QMap<QString, 
     return true;
 }
 
-QString TBuffer::jsonMenuArrayToString(const QJsonArray& menuArray)
+QStringList TBuffer::jsonMenuArrayToList(const QJsonArray& menuArray)
 {
     QStringList menuItems;
 
     for (const QJsonValue& item : menuArray) {
         if (item.isString() && item.toString() == qsl("-")) {
             // Separator
-            menuItems << qsl("Separator|-");
+            menuItems << qsl("Separator") << qsl("-");
         } else if (item.isObject()) {
             QJsonObject menuObj = item.toObject();
             // Each menu object should have one key-value pair: label -> command
             for (auto it = menuObj.begin(); it != menuObj.end(); ++it) {
-                if (it.value().isString()) {
-                    menuItems << it.key() + qsl("|") + it.value().toString();
+                // An empty command would send a blank line, which a server writes as send:
+                if (it.value().isString() && !it.value().toString().isEmpty()) {
+                    menuItems << it.key() << it.value().toString();
                 }
             }
         }
     }
 
-    return menuItems.join(qsl("|"));
+    return menuItems;
 }
 
 void TBuffer::parseJsonStateStyle(const QJsonObject& stateObj, Mudlet::HyperlinkStyling::StateStyle& stateStyle)
@@ -5623,20 +5638,20 @@ void TBuffer::parseJsonStateStyle(const QJsonObject& stateObj, Mudlet::Hyperlink
         }
     }
 
-    if (stateObj.contains(qsl("bold"))) {
-        stateStyle.isBold = jsonBoolValue(stateObj[qsl("bold")]);
+    if (const auto bold = jsonBoolValue(stateObj[qsl("bold")])) {
+        stateStyle.isBold = *bold;
         hasAnyCustomStyling = true;
     }
 
-    if (stateObj.contains(qsl("italic"))) {
-        stateStyle.isItalic = jsonBoolValue(stateObj[qsl("italic")]);
+    if (const auto italic = jsonBoolValue(stateObj[qsl("italic")])) {
+        stateStyle.isItalic = *italic;
         hasAnyCustomStyling = true;
     }
 
     if (stateObj.contains(qsl("underline"))) {
         QJsonValue underlineVal = stateObj[qsl("underline")];
-        if (underlineVal.isBool() || underlineVal.isDouble()) {
-            stateStyle.isUnderlined = jsonBoolValue(underlineVal);
+        if (const auto underlined = jsonBoolValue(underlineVal)) {
+            stateStyle.isUnderlined = *underlined;
             if (stateStyle.isUnderlined) {
                 stateStyle.underlineStyle = Mudlet::HyperlinkStyling::UnderlineSolid;
             }
@@ -5659,8 +5674,8 @@ void TBuffer::parseJsonStateStyle(const QJsonObject& stateObj, Mudlet::Hyperlink
 
     if (stateObj.contains(qsl("overline"))) {
         QJsonValue overlineVal = stateObj[qsl("overline")];
-        if (overlineVal.isBool() || overlineVal.isDouble()) {
-            stateStyle.isOverlined = jsonBoolValue(overlineVal);
+        if (const auto overlined = jsonBoolValue(overlineVal)) {
+            stateStyle.isOverlined = *overlined;
             hasAnyCustomStyling = true;
         } else if (overlineVal.isString()) {
             stateStyle.isOverlined = true;
@@ -5670,8 +5685,8 @@ void TBuffer::parseJsonStateStyle(const QJsonObject& stateObj, Mudlet::Hyperlink
 
     if (stateObj.contains(qsl("strikethrough"))) {
         QJsonValue strikeVal = stateObj[qsl("strikethrough")];
-        if (strikeVal.isBool() || strikeVal.isDouble()) {
-            stateStyle.isStrikeOut = jsonBoolValue(strikeVal);
+        if (const auto struckOut = jsonBoolValue(strikeVal)) {
+            stateStyle.isStrikeOut = *struckOut;
             hasAnyCustomStyling = true;
         } else if (strikeVal.isString()) {
             stateStyle.isStrikeOut = true;
@@ -5707,15 +5722,19 @@ void TBuffer::parseJsonSelectionConfig(const QJsonObject& selectionObj, Mudlet::
     }
 
     if (selectionObj.contains(qsl("toggle"))) {
-        settings.toggle = jsonBoolValue(selectionObj[qsl("toggle")]);
+        settings.toggle = jsonBoolValue(selectionObj[qsl("toggle")]).value_or(settings.toggle);
     }
 
     if (selectionObj.contains(qsl("selected"))) {
-        settings.selected = jsonBoolValue(selectionObj[qsl("selected")]);
+        settings.selected = jsonBoolValue(selectionObj[qsl("selected")]).value_or(settings.selected);
     }
 
     if (selectionObj.contains(qsl("exclusive"))) {
-        settings.exclusive = jsonBoolValue(selectionObj[qsl("exclusive")]);
+        settings.exclusive = jsonBoolValue(selectionObj[qsl("exclusive")]).value_or(settings.exclusive);
+    }
+
+    if (selectionObj.contains(qsl("disabled"))) {
+        settings.disabled = jsonBoolValue(selectionObj[qsl("disabled")]).value_or(settings.disabled);
     }
 }
 
@@ -5794,7 +5813,7 @@ bool TBuffer::parseVisibilityFromJson(const QJsonObject& visibilityObj, Mudlet::
 
     // Parse wholeline (optional)
     if (visibilityObj.contains(qsl("wholeline"))) {
-        settings.deletesEntireLine = jsonBoolValue(visibilityObj[qsl("wholeline")]);
+        settings.deletesEntireLine = jsonBoolValue(visibilityObj[qsl("wholeline")]).value_or(settings.deletesEntireLine);
     }
 
     // Parse expire triggers (optional)
@@ -5802,15 +5821,15 @@ bool TBuffer::parseVisibilityFromJson(const QJsonObject& visibilityObj, Mudlet::
         QJsonObject expireObj = visibilityObj[qsl("expire")].toObject();
 
         if (expireObj.contains(qsl("input"))) {
-            settings.expireOnInput = jsonBoolValue(expireObj[qsl("input")]);
+            settings.expireOnInput = jsonBoolValue(expireObj[qsl("input")]).value_or(settings.expireOnInput);
         }
 
         if (expireObj.contains(qsl("prompt"))) {
-            settings.expireOnPrompt = jsonBoolValue(expireObj[qsl("prompt")]);
+            settings.expireOnPrompt = jsonBoolValue(expireObj[qsl("prompt")]).value_or(settings.expireOnPrompt);
         }
 
         if (expireObj.contains(qsl("output"))) {
-            settings.expireOnOutput = jsonBoolValue(expireObj[qsl("output")]);
+            settings.expireOnOutput = jsonBoolValue(expireObj[qsl("output")]).value_or(settings.expireOnOutput);
         }
 
         if (expireObj.contains(qsl("outputDelay"))) {
@@ -7326,6 +7345,7 @@ void TBuffer::finaliseActiveHyperlink()
     mCurrentHyperlinkHint.clear();
     mCurrentHyperlinkLinkId = 0;
     mHyperlinkActive = false;
+    mHyperlinkEnclosingMxpLinkId = 0;
     // Reset enhanced styling
     mCurrentHyperlinkStyling = Mudlet::HyperlinkStyling();
     mCurrentHyperlinkMenu.clear();
@@ -7455,6 +7475,7 @@ void TBuffer::clear()
     mCurrentHyperlinkHint.clear();
     mCurrentHyperlinkLinkId = 0;
     mHyperlinkActive = false;
+    mHyperlinkEnclosingMxpLinkId = 0;
 
     // every line is about to go, so the tracked links and any announcement queued for them go with it
     if (auto* pHyperlinkManager = hyperlinkVisibilityManagerOrNull()) {
@@ -9236,7 +9257,7 @@ void TBuffer::styleForCurrentLink(TChar& c)
                 c.setBackground(effectiveStyling.backgroundColor);
             }
             if (effectiveStyling.isBold) {
-                c.setAttributes(TChar::Bold, true);
+                c.setAttributes(TChar::Bold | TChar::BoldAsked, true);
             }
             if (effectiveStyling.isItalic) {
                 c.setAttributes(TChar::Italic, true);
@@ -9299,7 +9320,7 @@ void TBuffer::styleForCurrentLink(TChar& c)
             }
 
             if (mCurrentHyperlinkStyling.isBold) {
-                c.setAttributes(TChar::Bold, true);
+                c.setAttributes(TChar::Bold | TChar::BoldAsked, true);
             }
 
             if (mCurrentHyperlinkStyling.isItalic) {
@@ -9317,7 +9338,10 @@ void TBuffer::styleForCurrentLink(TChar& c)
     }
 
     if (mpHost->mMxpClient.isInLinkMode()) {
-        c.mLinkIndex = mLinkStore.getCurrentLinkID();
+        // Whichever link opened inside the other is the one the text belongs to
+        if (!mHyperlinkActive || mHyperlinkEnclosingMxpLinkId != mpHost->mMxpClient.linkId()) {
+            c.mLinkIndex = mpHost->mMxpClient.linkId();
+        }
         c.setAttributes(TChar::Underline, true);
     }
 

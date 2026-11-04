@@ -66,7 +66,8 @@ public:
     enum class ConfigRoot { settledHere, leftToMainWindow };
 
     Q_DISABLE_COPY(HostManager)
-    explicit HostManager(ConfigRoot = ConfigRoot::settledHere);
+    // configDir, when settled here, is taken as the root in place of the one resolved, as a portable one is
+    explicit HostManager(ConfigRoot = ConfigRoot::settledHere, const QString& configDir = QString());
     ~HostManager();
 
     // A value member of the application object, so valid from that object's constructor body until its
@@ -90,7 +91,7 @@ public:
     // replaces the hook set before. The pool may outlive whoever set it, so the hook must capture no raw
     // pointer to its setter.
     void setProfileOpenedHook(std::function<void(Host*)> hook) { mProfileOpenedHook = std::move(hook); }
-    static QStringList defaultPackages(const QString& gameUrl, const QString& profileName, bool serverGuiAccepted);
+    static QStringList defaultPackages(const QString& address, const QString& profileName, bool serverGuiAccepted);
     // A profile tab's close button, with no window: sysExitEvent and the save now, out of the pool once
     // no script of its own is running. False if no such profile is open.
     bool requestProfileClose(const QString& name);
