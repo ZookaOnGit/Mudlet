@@ -554,6 +554,8 @@ void TConsoleModelSink::printFormatted(const QString& text, const std::vector<TC
 void TConsoleModelSink::discardAll()
 {
     mModel.clear();
+    // As TConsole::discardAll() clears through bufferCleared(), which closes its split
+    emit mModel.mNotifier.bufferCleared();
 }
 
 void TConsoleModelSink::discardLastLine()
@@ -802,6 +804,9 @@ QDataStream& operator>>(QDataStream& in, TNullConsoleFrontend::Placement& placem
 TNullConsoleFrontend::TNullConsoleFrontend(Host* pHost)
 : mpHost(pHost)
 {
+    // Not TCommandLine's first state, in which Tab on an empty line puts a word of the buffer there, but the one it
+    // is in after any send, in which that does nothing
+    endMainCommandLineCompletion();
 }
 
 TNullConsoleFrontend::~TNullConsoleFrontend() = default;
@@ -816,8 +821,13 @@ void TNullConsoleFrontend::dropWindows()
     mpMainHolder = std::make_unique<QObject>();
     mFrameHolders.clear();
     mMxpFrames.clear();
-    // The view's TCommandLine has its own menu items, which go with it
+    // The view's TCommandLine has its own menu items and words for Tab, which go with it
     mMainCommandLine.menuItems.clear();
+    mMainCommandLine.suggestions.clear();
+    mMainCommandLine.blacklist.clear();
+    mMainCommandLineCompletion = TCommandLineCompletion();
+    endMainCommandLineCompletion();
+    mMainCommandLineWhollySelected = false;
     // The view has its own map widget, if any. An embedded mapper went with the main window's stand-in.
     mMapWidget.reset();
     mpEmbeddedMapperBox.reset();
@@ -1147,7 +1157,101 @@ TConsoleModel& TNullConsoleFrontend::addSubConsole(const QString& name, const TW
             removeSubConsole(name);
         }
     });
+    // As TConsole connects only these two, the only kinds that can be told not to scroll
+    if (kind == TWindowRegistry::SubConsoleKind::MiniConsole || kind == TWindowRegistry::SubConsoleKind::UserWindow) {
+        QObject::connect(&model.mNotifier, &TConsoleModelNotifier::linesAppended, &model.mNotifier, [this, &model](const int lineCount) {
+            reportLinesOverflow(model, lineCount);
+        });
+        // As TConsole::applyTimeStamps(), shown or not
+        QObject::connect(&model.mNotifier, &TConsoleModelNotifier::timeStampsToggled, &model.mNotifier, [this, name]() {
+            // A hidden pane keeps the size it had until the resize it is owed reaches it
+            if (const auto it = mSubConsoles.find(name); it != mSubConsoles.end() && (!it->second.paneResizePending || paneShown(it->second))) {
+                reportConsoleSize(name);
+            }
+        });
+        // As TConsole::bufferCleared() closes the split, which TConsoleModel::clear() has already forgotten
+        QObject::connect(&model.mNotifier, &TConsoleModelNotifier::bufferCleared, &model.mNotifier, [this, name, &model]() {
+            const QSize before = model.mGridSize;
+            reportGridSize(name);
+            if (model.mGridSize != before) {
+                resizePane(name);
+            }
+        });
+    }
     return model;
+}
+
+// As TConsole::handleLinesOverflowEvent()
+void TNullConsoleFrontend::reportLinesOverflow(const TConsoleModel& model, const int lineCount)
+{
+    if (model.mScrollingEnabled) {
+        return;
+    }
+    const int linesSpare = model.mGridSize.height() - lineCount;
+    if (linesSpare >= 0) {
+        return;
+    }
+    TEvent event{};
+    event.mArgumentList.append(qsl("sysWindowOverflowEvent"));
+    event.mArgumentTypeList.append(ARGUMENT_TYPE_STRING);
+    event.mArgumentList.append(model.mConsoleName);
+    event.mArgumentTypeList.append(ARGUMENT_TYPE_STRING);
+    event.mArgumentList.append(QString::number(-linesSpare));
+    event.mArgumentTypeList.append(ARGUMENT_TYPE_NUMBER);
+    mpHost->raiseEvent(event);
+}
+
+// As TTextEdit::resizeEvent(), which a hidden pane is sent only as it shows
+void TNullConsoleFrontend::resizePane(const QString& name)
+{
+    const auto it = mSubConsoles.find(name);
+    if (it == mSubConsoles.end()) {
+        return;
+    }
+    if (!paneShown(it->second) || it->second.sendingResize) {
+        it->second.paneResizePending = true;
+        return;
+    }
+    it->second.paneResizePending = false;
+    reportConsoleSize(name);
+}
+
+// As QWidget::show() sends a pane, and each pane in what it shows, the resize it was owed while hidden
+void TNullConsoleFrontend::sendPendingPaneResize(const QString& name)
+{
+    const auto it = mSubConsoles.find(name);
+    if (it == mSubConsoles.end() || !it->second.paneResizePending || it->second.sendingResize || !paneShown(it->second)) {
+        return;
+    }
+    it->second.paneResizePending = false;
+    reportConsoleSize(name);
+}
+
+// As TConsole::raiseMudletResizeEvent()
+void TNullConsoleFrontend::reportConsoleSize(const QString& name)
+{
+    const auto it = mSubConsoles.find(name);
+    if (it == mSubConsoles.end() || mpHost->windowRegistry().subConsoleKind(name) == TWindowRegistry::SubConsoleKind::Buffer) {
+        return;
+    }
+    const TConsoleModel& model = *it->second.pModel;
+    const QSize grid = model.mGridSize;
+    if (!grid.width() || grid == it->second.reportedGrid) {
+        return;
+    }
+    it->second.reportedGrid = grid;
+    TEvent event{};
+    event.mArgumentList.append(qsl("sysConsoleSizeChanged"));
+    event.mArgumentTypeList.append(ARGUMENT_TYPE_STRING);
+    event.mArgumentList.append(name);
+    event.mArgumentTypeList.append(ARGUMENT_TYPE_STRING);
+    event.mArgumentList.append(QString::number(grid.width()));
+    event.mArgumentTypeList.append(ARGUMENT_TYPE_NUMBER);
+    event.mArgumentList.append(QString::number(grid.height()));
+    event.mArgumentTypeList.append(ARGUMENT_TYPE_NUMBER);
+    event.mArgumentList.append(QString::number(model.mShowTimeStamps ? TBuffer::smTimeStampFormat.size() : 0));
+    event.mArgumentTypeList.append(ARGUMENT_TYPE_NUMBER);
+    mpHost->raiseEvent(event);
 }
 
 void TNullConsoleFrontend::removeSubConsole(const QString& name, const bool keepWidget)
@@ -1442,6 +1546,11 @@ std::pair<bool, QString> TNullConsoleFrontend::createMapper(const QString& windo
     if (mMapWidget) {
         // As TMainConsole::createMapper() deleting the hidden map dock leaves QMainWindow its placeholder
         TAppFrontend::instance()->mapWidgetRemoved(mpHost);
+        // Deferred, as the GUI's dock is: a map info contributor or a mouse press handler drawing this view may be
+        // the caller
+        TNullMapView* pOldView = mMapWidget->pView.release();
+        pOldView->setParent(mpMainHolder.get());
+        pOldView->deleteLater();
         mMapWidget.reset();
     }
     if (!mpEmbeddedMapper) {
@@ -1642,10 +1751,12 @@ bool TNullConsoleFrontend::setSubConsoleShown(const QString& name, const bool sh
     }
     if (mpHost->windowRegistry().subConsoleKind(name) != TWindowRegistry::SubConsoleKind::UserWindow) {
         it->second.shown = shown;
+        sendPendingPaneResize(name);
         reportWindowVisibility(name);
         return true;
     }
     it->second.shown = shown;
+    const QPointer<const QObject> window = &it->second.pModel->mNotifier;
     if (shown) {
         // The dock's layout gives its console a size it took while hidden only now, before the console shows
         const QSize size = mpHost->windowRegistry().subConsoleGeometry(name).value_or(QRect()).size();
@@ -1659,13 +1770,16 @@ bool TNullConsoleFrontend::setSubConsoleShown(const QString& name, const bool sh
         // though what it holds answers as isVisibleTo() once a change reaches it (see reportVisibility()), and clears it
         // only once that is sent
         it->second.sendingResize = true;
-        const QPointer<const QObject> window = &it->second.pModel->mNotifier;
         raiseUserWindowResize(name);
         // Its handlers can delete the window, or open another of its name
         if (const auto again = mSubConsoles.find(name); window && again != mSubConsoles.end() && &again->second.pModel->mNotifier == window) {
             again->second.resizePending = false;
             again->second.sendingResize = false;
         }
+    }
+    // Its pane is sent the resize it is owed only as it shows, after the dock's
+    if (const auto again = mSubConsoles.find(name); shown && window && again != mSubConsoles.end() && &again->second.pModel->mNotifier == window) {
+        sendPendingPaneResize(name);
     }
     reportVisibility(name, nullptr);
     // A handler that deletes the window leaves showWindow() with none to show
@@ -1767,6 +1881,9 @@ void TNullConsoleFrontend::reportVisibility(const QString& changedWindow, const 
     }
     for (const QString& name : names) {
         reportWindowVisibility(name);
+    }
+    for (const QString& name : names) {
+        sendPendingPaneResize(name);
     }
 }
 
@@ -2189,6 +2306,8 @@ bool TNullConsoleFrontend::replaceCommandLineText(const QString& name, const QSt
         mMainCommandLineTyped = false;
         mMainCommandLineAllSelected = false;
         mMainCommandLineRewritten = true;
+        mMainCommandLineWhollySelected = false;
+        endMainCommandLineCompletion();
         const QString plain = plainText(text);
         mpHost->windowRegistry().setMainCommandLineText(plain);
         emit mpHost->signal_commandLineTextRequested(plain);
@@ -2205,6 +2324,8 @@ bool TNullConsoleFrontend::holdMainCommandLineForSend(const QString& line)
     }
     mMainCommandLineTyped = false;
     mMainCommandLineAllSelected = false;
+    mMainCommandLineWhollySelected = false;
+    endMainCommandLineCompletion();
     mpHost->windowRegistry().setMainCommandLineText(plainText(line));
     return true;
 }
@@ -2214,10 +2335,16 @@ void TNullConsoleFrontend::mainCommandLineSent()
     // TCommandLine::enterCommand() selects a line it keeps
     if (!mpHost->mAutoClearCommandLineAfterSend) {
         mMainCommandLineAllSelected = true;
+        mMainCommandLineWhollySelected = true;
         return;
     }
     if (mpHost->passwordEntryWanted()) {
         mMainCommandLineTyped = false;
+        // The app's line is set aside until hidden input ends, as the GUI's line is behind its box. Only set here, as
+        // a send that began inside this one's aliases may have emptied the line already.
+        if (!mpHost->windowRegistry().commandLineText(QString()).value_or(QString()).isEmpty()) {
+            mMainCommandLineClearPending = true;
+        }
         mpHost->windowRegistry().setMainCommandLineText(QString());
     } else {
         replaceCommandLineText(QString(), QString());
@@ -2230,6 +2357,7 @@ void TNullConsoleFrontend::setCommandLineText(const QString& text)
     // As TMainConsole::setCommandLineText()
     if (!mpHost->passwordEntryWanted()) {
         mMainCommandLineAllSelected = true;
+        mMainCommandLineWhollySelected = true;
     }
 }
 
@@ -2240,14 +2368,27 @@ bool TNullConsoleFrontend::selectCommandLineText(const QString& name)
     }
     if (mainCommandLine(name) && !mpHost->passwordEntryWanted()) {
         mMainCommandLineAllSelected = true;
+        mMainCommandLineWhollySelected = true;
     }
     return true;
 }
 
 void TNullConsoleFrontend::typeMainCommandLine(const QString& text, const bool playerTyped)
 {
-    TWindowRegistry& registry = mpHost->windowRegistry();
     const QString plain = plainText(text);
+    // Mudlet sees each new line, never the key that made it, so any change ends Tab's cycle and the history walk, as
+    // Backspace does on the GUI's line; the line a completion left, handed back, is no change
+    if (plain != mpHost->windowRegistry().commandLineText(QString()).value_or(QString()) && plain != mMainCommandLineCompleted) {
+        endMainCommandLineCompletion();
+        // The GUI's line shows a recall all selected
+        mMainCommandLineWhollySelected = !playerTyped;
+    }
+    writeMainCommandLine(plain, playerTyped);
+}
+
+void TNullConsoleFrontend::writeMainCommandLine(const QString& plain, const bool playerTyped)
+{
+    TWindowRegistry& registry = mpHost->windowRegistry();
     const QString current = registry.commandLineText(QString()).value_or(QString());
     // As TCommandLine::slot_contentsChange(): typing on into a line a script set leaves it the script's, but typing
     // over it replaces it with a line of the player's. Mudlet does not see the app's caret or selection, so any
@@ -2266,6 +2407,54 @@ void TNullConsoleFrontend::typeMainCommandLine(const QString& text, const bool p
     }
     mMainCommandLineRewritten = true;
     registry.setMainCommandLineText(plain);
+}
+
+void TNullConsoleFrontend::endMainCommandLineCompletion()
+{
+    mMainCommandLineCompletion.reset();
+    mMainCommandLineCompletion.resetHistoryWalk();
+    mMainCommandLineCompleted.reset();
+}
+
+std::optional<QString> TNullConsoleFrontend::tabCompleteMainCommandLine(const bool forward)
+{
+    TWindowRegistry& registry = mpHost->windowRegistry();
+    const auto completion = mMainCommandLineCompletion.tabComplete(
+            registry.commandLineText(QString()).value_or(QString()), forward, mpHost->mainConsoleModel().buffer, mMainCommandLine.suggestions, mMainCommandLine.blacklist);
+    if (!completion) {
+        return std::nullopt;
+    }
+    writeMainCommandLine(plainText(completion->line), false);
+    mMainCommandLineWhollySelected = false;
+    const QString shown = registry.commandLineText(QString()).value_or(QString());
+    mMainCommandLineCompletion.setShownLine(shown);
+    mMainCommandLineCompleted = shown;
+    return shown;
+}
+
+std::optional<QString> TNullConsoleFrontend::historyCompleteMainCommandLine()
+{
+    TWindowRegistry& registry = mpHost->windowRegistry();
+    const QStringList history = mainCommandLineHistory();
+    const QString line = registry.commandLineText(QString()).value_or(QString());
+    // TCommandLine::historyMove() recalls a whole line instead for an empty line or none in the history
+    if (line.isEmpty() || history.isEmpty()) {
+        return std::nullopt;
+    }
+    const auto completion = mMainCommandLineCompletion.historyComplete(line, true, history, true);
+    if (!completion.line && !completion.tailCut) {
+        return std::nullopt;
+    }
+    // Only Tab's cycle: the walk goes on from here
+    mMainCommandLineCompletion.reset();
+    writeMainCommandLine(plainText(completion.line.value_or(completion.typed)), false);
+    mMainCommandLineWhollySelected = false;
+    const QString shown = registry.commandLineText(QString()).value_or(QString());
+    if (completion.line) {
+        mMainCommandLineCompletion.setHistoryCompletion(shown);
+    }
+    mMainCommandLineCompleted = shown;
+    return shown;
 }
 
 bool TNullConsoleFrontend::hiddenInputOpened()
@@ -2290,6 +2479,14 @@ bool TNullConsoleFrontend::hiddenInputOpened()
     registry.wipeMainCommandLineText();
     mpHost->passwordEntryEdited();
     return true;
+}
+
+void TNullConsoleFrontend::hiddenInputClosed()
+{
+    if (mMainCommandLineClearPending) {
+        mMainCommandLineClearPending = false;
+        emit mpHost->signal_commandLineTextRequested(QString());
+    }
 }
 
 bool TNullConsoleFrontend::appendCommandLineText(const QString& name, const QString& text)
@@ -2317,6 +2514,66 @@ std::optional<bool> TNullConsoleFrontend::removeCommandLineMenuItem(const QStrin
         return std::nullopt;
     }
     return pCommandLine->menuItems.erase(label) != 0;
+}
+
+bool TNullConsoleFrontend::addCommandLineSuggestion(const QString& name, const QString& word)
+{
+    PlainWindow* pCommandLine = commandLineNamed(name);
+    if (!pCommandLine) {
+        return false;
+    }
+    pCommandLine->suggestions.insert(word);
+    return true;
+}
+
+bool TNullConsoleFrontend::removeCommandLineSuggestion(const QString& name, const QString& word)
+{
+    PlainWindow* pCommandLine = commandLineNamed(name);
+    if (!pCommandLine) {
+        return false;
+    }
+    pCommandLine->suggestions.remove(word);
+    return true;
+}
+
+bool TNullConsoleFrontend::clearCommandLineSuggestions(const QString& name)
+{
+    PlainWindow* pCommandLine = commandLineNamed(name);
+    if (!pCommandLine) {
+        return false;
+    }
+    pCommandLine->suggestions.clear();
+    return true;
+}
+
+bool TNullConsoleFrontend::addCommandLineBlacklistWord(const QString& name, const QString& word)
+{
+    PlainWindow* pCommandLine = commandLineNamed(name);
+    if (!pCommandLine) {
+        return false;
+    }
+    pCommandLine->blacklist.insert(word);
+    return true;
+}
+
+bool TNullConsoleFrontend::removeCommandLineBlacklistWord(const QString& name, const QString& word)
+{
+    PlainWindow* pCommandLine = commandLineNamed(name);
+    if (!pCommandLine) {
+        return false;
+    }
+    pCommandLine->blacklist.remove(word);
+    return true;
+}
+
+bool TNullConsoleFrontend::clearCommandLineBlacklist(const QString& name)
+{
+    PlainWindow* pCommandLine = commandLineNamed(name);
+    if (!pCommandLine) {
+        return false;
+    }
+    pCommandLine->blacklist.clear();
+    return true;
 }
 
 bool TNullConsoleFrontend::setCommandLineSavesHistory(const QString& name, const bool savesHistory)
@@ -2369,6 +2626,9 @@ bool TNullConsoleFrontend::setWindowCommandLineVisible(const QString& name, cons
             it->second.shown = visible;
             reportWindowVisibility(name);
         }
+        // As TConsole::setCmdVisible() resizes the console either way
+        reportGridSize(name);
+        resizePane(name);
         return true;
     }
     // A deleted one is still held until deferred deletes run, and nothing is made in its place
@@ -2394,6 +2654,8 @@ bool TNullConsoleFrontend::setWindowCommandLineVisible(const QString& name, cons
     registry.setCommandLineStyleSheet(name, commandLineSheet(mpHost->mCommandLineBgColor));
     // As TMainConsole::registerSubCommandLine() reports the name, and so the console's own window
     reportWindowVisibility(name);
+    reportGridSize(name);
+    resizePane(name);
     return true;
 }
 
@@ -2899,6 +3161,7 @@ std::pair<bool, QString> TNullConsoleFrontend::reparentWindow(const QString& win
         }
         moveSubConsole(name, x, y);
         reportWindowVisibility(name);
+        sendPendingPaneResize(name);
         return {true, QString()};
     }
     const auto it = mScrollBoxes.find(name);
@@ -3063,6 +3326,7 @@ bool TNullConsoleFrontend::resizeSubConsole(const QString& name, const int width
     }
     TWindowRegistry& registry = mpHost->windowRegistry();
     QRect geometry = registry.subConsoleGeometry(name).value_or(QRect());
+    const QSize before = geometry.size();
     geometry.setSize(widgetSize(width, height));
     registry.setSubConsoleGeometry(name, geometry);
     registry.setUserWindowSize(name, geometry.size());
@@ -3071,9 +3335,14 @@ bool TNullConsoleFrontend::resizeSubConsole(const QString& name, const int width
     if (externalFrame(name)) {
         mpHost->mMxpFrameManager.setWindowSize(name, geometry.size());
     }
-    // A hidden dock's console takes the size as it next shows
+    // After the frame's report, which a handler of the pane's report resizing it again would otherwise outdate
+    if (geometry.size() != before) {
+        resizePane(name);
+    }
+    // A hidden dock's console takes the size as it next shows, and a handler of the pane's report may have resized it
     const auto it = mSubConsoles.find(name);
-    if (it == mSubConsoles.end() || !it->second.shown || it->second.consoleSize == geometry.size() || registry.subConsoleKind(name) != TWindowRegistry::SubConsoleKind::UserWindow) {
+    if (it == mSubConsoles.end() || !it->second.shown || it->second.consoleSize == geometry.size() || registry.subConsoleGeometry(name).value_or(QRect()).size() != geometry.size()
+        || registry.subConsoleKind(name) != TWindowRegistry::SubConsoleKind::UserWindow) {
         return true;
     }
     it->second.consoleSize = geometry.size();
@@ -3135,6 +3404,11 @@ void TNullConsoleFrontend::setBorderColor(const QColor& color)
     mpHost->mainConsoleModel().mBorderColor = color;
 }
 
+void TNullConsoleFrontend::applyBorders()
+{
+    mpHost->layOutMainAreaWithNoView(Host::MainAreaChange::borders);
+}
+
 // As TConsole::setConsoleBgColor() leaves a sub-console's model
 bool TNullConsoleFrontend::setSubConsoleBackgroundColor(const QString& name, const QColor& color)
 {
@@ -3193,8 +3467,10 @@ bool TNullConsoleFrontend::setWindowScrolling(const QString& name, const bool en
     const auto kind = mpHost->windowRegistry().subConsoleKind(name);
     if (kind == TWindowRegistry::SubConsoleKind::MiniConsole || kind == TWindowRegistry::SubConsoleKind::UserWindow) {
         pModel->mScrollingEnabled = enabled;
-        if (!enabled) {
+        if (!enabled && pModel->mScrolledBackTo) {
             pModel->mScrolledBackTo.reset();
+            reportGridSize(name);
+            resizePane(name);
         }
     }
     return true;
@@ -3206,16 +3482,19 @@ bool TNullConsoleFrontend::scrollWindowTo(const QString& name, const int line, c
     if (!pModel) {
         return false;
     }
+    const bool wasSplit = pModel->mScrolledBackTo.has_value();
     const int lastLine = pModel->buffer.getLastLineNumber();
+    // A buffer is never painted, so a real one never shows itself scrolled back
     if (toEnd || line >= lastLine) {
         pModel->mScrolledBackTo.reset();
-        return true;
+    } else if (pModel->mScrollingEnabled && mpHost->windowRegistry().subConsoleKind(name) != TWindowRegistry::SubConsoleKind::Buffer) {
+        pModel->mScrolledBackTo = line < 0 ? std::max(lastLine + line, 0) : line;
     }
-    // A buffer is never painted, so a real one never shows itself scrolled back
-    if (!pModel->mScrollingEnabled || mpHost->windowRegistry().subConsoleKind(name) == TWindowRegistry::SubConsoleKind::Buffer) {
-        return true;
+    // As TConsole's lower pane showing or hiding resizes the upper one
+    if (pModel->mScrolledBackTo.has_value() != wasSplit) {
+        reportGridSize(name);
+        resizePane(name);
     }
-    pModel->mScrolledBackTo = line < 0 ? std::max(lastLine + line, 0) : line;
     return true;
 }
 
@@ -3232,7 +3511,20 @@ void TNullConsoleFrontend::reportGridSize(const QString& name)
     if (!pModel) {
         return;
     }
-    const QSize size = mpHost->windowRegistry().subConsoleGeometry(name).value_or(QRect()).size();
+    QSize size = mpHost->windowRegistry().subConsoleGeometry(name).value_or(QRect()).size();
+    // TConsole::layoutMainDisplay() takes its own command line, in a layer fixed at 31 pixels tall, off the pane
+    const auto console = mSubConsoles.find(name);
+    const auto commandLine = mCommandLines.find(name);
+    if (console != mSubConsoles.end() && commandLine != mCommandLines.end() && ownsLine(console->second, commandLine->second) && commandLine->second.shown) {
+        size.setHeight(std::max(0, size.height() - 31));
+    }
+    // TConsole's splitter gives a scrolled-back console's upper pane 6 of every 8 pixels its 3px handle leaves,
+    // rounded half up: measured in the GUI, as its constructor's 6:1 stretch factors suggest otherwise. A change to
+    // that split must change this too
+    const auto kind = mpHost->windowRegistry().subConsoleKind(name);
+    if (pModel->mScrolledBackTo && (kind == TWindowRegistry::SubConsoleKind::MiniConsole || kind == TWindowRegistry::SubConsoleKind::UserWindow)) {
+        size.setHeight((std::max(0, size.height() - 3) * 6 + 4) / 8);
+    }
     const QFontMetricsF metrics(pModel->mUpperPaneFont);
     pModel->mGridSize = QSize(qRound(size.width() / metrics.averageCharWidth()), qRound(size.height() / metrics.lineSpacing()));
 }
@@ -3358,4 +3650,24 @@ bool TNullConsoleFrontend::setWindowFontSize(const QString& name, const int size
         setSubConsoleFont(name, font.makeFont());
     }
     return true;
+}
+
+// Timed as TMainConsole times a pass for its latency box. With no window to be minimized, whether the app's is is the
+// session's to say
+bool TNullConsoleFrontend::startIncomingText()
+{
+    mIncomingTextTimer.restart();
+    return mpHost->mAlertOnNewData;
+}
+
+void TNullConsoleFrontend::alertNewData()
+{
+    emit mpHost->mainConsoleModel().mNotifier.newDataAlerted();
+}
+
+void TNullConsoleFrontend::finishIncomingText(bool)
+{
+    TConsoleModel& model = mpHost->mainConsoleModel();
+    model.mIncomingTextSeconds = mIncomingTextTimer.elapsed() / 1000.0;
+    emit model.mNotifier.incomingTextProcessed();
 }

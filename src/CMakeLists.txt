@@ -57,6 +57,7 @@ set(mudlet_SRCS
     EditorUndoStack.cpp
     EnvironmentKit.cpp
     EventLoopPump.cpp
+    EventNames.cpp
     ExitAppearance.cpp
     FontManager.cpp
     GifTracker.cpp
@@ -67,6 +68,7 @@ set(mudlet_SRCS
     KeyUnit.cpp
     LuaInterface.cpp
     LuaLiteral.cpp
+    MailtoUri.cpp
     mapInfoContributorManager.cpp
     MapDecals.cpp
     MapStyle.cpp
@@ -97,8 +99,10 @@ set(mudlet_SRCS
     TAudioMixer.cpp
     TBuffer.cpp
     TCommandHistory.cpp
+    TCommandLineCompletion.cpp
     TConsoleModel.cpp
     TDebug.cpp
+    TelnetUri.cpp
     TEncodingHelper.cpp
     TEncodingTable.cpp
     TEntityHandler.cpp
@@ -125,6 +129,7 @@ set(mudlet_SRCS
     TLuaInterpreterUI.cpp
     TMap.cpp
     TMapLabel.cpp
+    TMapPainter.cpp
     TMedia.cpp
     TMediaVoice.cpp
     TMediaPlaylist.cpp
@@ -185,6 +190,11 @@ set(mudlet_SRCS
 # here instead, in mudlet_app, kept in alphabetical order (case-insensitive).
 set(mudlet_app_SRCS
     ../3rdparty/qt-tags-widget/src/qtagedit.cpp
+    AboutLinkButton.cpp
+    AlphaColourWell.cpp
+    AboutSupporterBanner.cpp
+    ChipRow.cpp
+    ContentScrollArea.cpp
     CustomLineDrawContextMenuHandler.cpp
     CustomLineDrawHandler.cpp
     CustomLineEditContextMenuHandler.cpp
@@ -219,8 +229,16 @@ set(mudlet_app_SRCS
     dlgVarsMainArea.cpp
     EAction.cpp
     EditorAutoCompleteFocusHandler.cpp
+    EditorLineMarginDelegate.cpp
+    EditorPlaceholderButton.cpp
+    EditorTreeDelegate.cpp
+    EditorTreeRowDelegate.cpp
+    EditorTreeRowMetrics.cpp
     exitstreewidget.cpp
+    ExporterTreeDelegate.cpp
     FileOpenHandler.cpp
+    FlowLayout.cpp
+    GripSplitter.cpp
     HostDialogs.cpp
     LabelInteractionHandler.cpp
     MiddleMousePanHandler.cpp
@@ -228,11 +246,15 @@ set(mudlet_app_SRCS
     MudletInstanceCoordinator.cpp
     MudletProxyStyle.cpp
     PackageItemDelegate.cpp
+    PairGridLayout.cpp
     PanInteractionHandler.cpp
     RoomContextMenuHandler.cpp
     RoomMoveActivationHandler.cpp
     RoomMoveDragHandler.cpp
+    SearchResultDelegate.cpp
     SelectionRectangleHandler.cpp
+    SidebarItemDelegate.cpp
+    SidebarToggle.cpp
     SingleLineTextEdit.cpp
     T2DMap.cpp
     TAccessibleLabel.cpp
@@ -260,9 +282,12 @@ set(mudlet_app_SRCS
     TTabBar.cpp
     TTextBox.cpp
     TTextEdit.cpp
+    ToolBarOverflow.cpp
     TToolBar.cpp
     TTreeWidget.cpp
     TUiTour.cpp
+    uiDesign.cpp
+    VariableTreeDelegate.cpp
     WideComboBox.cpp
     widgetutils.cpp)
 
@@ -361,6 +386,7 @@ set(mudlet_HDRS
     EnvironmentKit.h
     enums.h
     EventLoopPump.h
+    EventNames.h
     ExitAppearance.h
     FontManager.h
     GifTracker.h
@@ -371,6 +397,7 @@ set(mudlet_HDRS
     KeyUnit.h
     LuaInterface.h
     LuaLiteral.h
+    MailtoUri.h
     MacMicrophonePermission.h
     mapInfoContributorManager.h
     MapDecals.h
@@ -406,10 +433,12 @@ set(mudlet_HDRS
     TAudioMixer.h
     TBuffer.h
     TCommandHistory.h
+    TCommandLineCompletion.h
     TConsoleFrontend.h
     TConsoleModel.h
     TConsoleModelNotifier.h
     TDebug.h
+    TelnetUri.h
     TEncodingHelper.h
     TEncodingTable.h
     TEntityHandler.h
@@ -430,6 +459,7 @@ set(mudlet_HDRS
     TLuaInterpreter.h
     TMap.h
     TMapLabel.h
+    TMapPainter.h
     TMapViewFrontend.h
     TMapViewsFrontend.h
     TMatchState.h
@@ -471,6 +501,7 @@ set(mudlet_HDRS
     TMxpVarTagHandler.h
     TMxpVersionTagHandler.h
     TNullAppFrontend.h
+    TNullAppFrontendNotifier.h
     TNullConsoleFrontend.h
     TNullMapView.h
     TNullMapViews.h
@@ -504,6 +535,11 @@ set(mudlet_HDRS
 # here instead, in mudlet_app, kept in alphabetical order (case-insensitive).
 set(mudlet_app_HDRS
     ../3rdparty/qt-tags-widget/include/QTagEdit/qtagedit.hpp
+    AboutLinkButton.h
+    AlphaColourWell.h
+    AboutSupporterBanner.h
+    ChipRow.h
+    ContentScrollArea.h
     CustomLineDrawContextMenuHandler.h
     CustomLineDrawHandler.h
     CustomLineEditContextMenuHandler.h
@@ -538,8 +574,16 @@ set(mudlet_app_HDRS
     dlgVarsMainArea.h
     EAction.h
     EditorAutoCompleteFocusHandler.h
+    EditorLineMarginDelegate.h
+    EditorPlaceholderButton.h
+    EditorTreeDelegate.h
+    EditorTreeRowDelegate.h
+    EditorTreeRowMetrics.h
     exitstreewidget.h
+    ExporterTreeDelegate.h
     FileOpenHandler.h
+    FlowLayout.h
+    GripSplitter.h
     HostDialogs.h
     LabelInteractionHandler.h
     MiddleMousePanHandler.h
@@ -547,11 +591,15 @@ set(mudlet_app_HDRS
     MudletInstanceCoordinator.h
     MudletProxyStyle.h
     PackageItemDelegate.h
+    PairGridLayout.h
     PanInteractionHandler.h
     RoomContextMenuHandler.h
     RoomMoveActivationHandler.h
     RoomMoveDragHandler.h
+    SearchResultDelegate.h
     SelectionRectangleHandler.h
+    SidebarItemDelegate.h
+    SidebarToggle.h
     SingleLineTextEdit.h
     T2DMap.h
     TAccessibleConsole.h
@@ -580,9 +628,12 @@ set(mudlet_app_HDRS
     TTabBar.h
     TTextBox.h
     TTextEdit.h
+    ToolBarOverflow.h
     TToolBar.h
     TTreeWidget.h
     TUiTour.h
+    uiDesign.h
+    VariableTreeDelegate.h
     WideComboBox.h
     widgetutils.h)
 
@@ -733,6 +784,8 @@ find_package(ZLIB REQUIRED)
 # fixed it mis-optimising the start of a match in 8-bit mode with PCRE2_CASELESS
 find_package(PCRE2 10.36 REQUIRED)
 find_package(PUGIXML REQUIRED)
+# lua-yajl already needs libyajl at runtime; parseJSON() drives its parser directly
+find_package(YAJL REQUIRED)
 find_package(HUNSPELL REQUIRED)
 find_package(Boost 1.44 CONFIG REQUIRED)
 message(STATUS "Found Boost: ${Boost_DIR} (found version \"${Boost_VERSION}\")")
@@ -973,6 +1026,7 @@ target_link_libraries(
         LUA51::LUA51
         PCRE2::PCRE2
         PUGIXML::PUGIXML
+        YAJL::YAJL
         ZIP::ZIP
         ZLIB::ZLIB
 # PLACEMARKER: sample benchmarking code
@@ -1081,7 +1135,7 @@ if(USE_GUI)
 
   # main() stays out of the libraries: a test that links them brings its own, and
   # the linker can pull main.cpp's object in for any inline function it defines.
-  add_executable(${EXE_MUDLET_TARGET} main.cpp)
+  add_executable(${EXE_MUDLET_TARGET} main.cpp HardwareDeviceTypes.h)
   target_compile_definitions(${EXE_MUDLET_TARGET} PRIVATE APP_TARGET="${APP_TARGET}")
   set_target_properties(${EXE_MUDLET_TARGET} PROPERTIES OUTPUT_NAME ${EXE_MUDLET_NAME})
   target_link_libraries(${EXE_MUDLET_TARGET} ${LIB_MUDLET_APP_TARGET} mudlet_lsan_hooks)

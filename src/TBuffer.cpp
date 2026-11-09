@@ -25,6 +25,7 @@
 
 #include "Host.h"
 #include "LuaLiteral.h"
+#include "MailtoUri.h"
 #include "MudletApp.h"
 #include "TAppFrontend.h"
 #include "TConsoleModel.h"
@@ -37,6 +38,7 @@
 #include "TStringUtils.h"
 #include "UntrustedText.h"
 #include "TTextProperties.h"
+#include "TelnetUri.h"
 #include "widechar_width.h"
 #include "TEncodingHelper.h"
 #include "SentryWrapper.h"
@@ -227,15 +229,56 @@ int clampedWrapIndent(const int indentSize, const int maxWidth)
     return (indentSize > 0 && indentSize < maxWidth) ? std::min(indentSize, maxWidth / 2) : 0;
 }
 
+// Whether the line has no LineFeed and fits widthAvailable by a column count never below getWrapInfo()'s: a
+// grapheme is as wide as its first code point (an unpaired surrogate may pair with the next QChar there) or
+// one column wider for VS16, and no width is negative. Out of line, keeping fitsUnwrapped() cheap to inline.
+Q_NEVER_INLINE bool codePointColumnsFit(const QString& lineText, const qsizetype widthAvailable, const QPointer<Host>& host)
+{
+    // getWrapInfo() reads the same setting, and has no host to read it from only when it does not wrap at all
+    const bool wideAmbiguous = host ? host->wideAmbiguousEAsianGlyphs() : true;
+    qsizetype columns = 0;
+    const qsizetype total = lineText.size();
+    const QChar* const units = lineText.constData();
+    for (qsizetype i = 0; i < total; ++i) {
+        const char16_t unit = units[i].unicode();
+        if (unit >= 0x20 && unit < 0x7F) {
+            ++columns;
+        } else if (unit == QChar::LineFeed) {
+            return false;
+        } else if (QChar::isHighSurrogate(unit) && i + 1 < total && units[i + 1].isLowSurrogate()) {
+            columns += graphemeInfo::getWidth(QChar::surrogateToUcs4(unit, units[i + 1].unicode()), wideAmbiguous);
+            ++i;
+        } else if (QChar::isSurrogate(unit)) {
+            columns += graphemeInfo::maxWidth;
+        } else if (unit == 0xFE0F) {
+            // VS16 may draw a one-column symbol before it as a two-column emoji
+            ++columns;
+        } else {
+            columns += graphemeInfo::getWidth(unit, wideAmbiguous);
+        }
+        if (columns > widthAvailable) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // True only if getWrapInfo() would find no break, decided without its scan, the costliest part of appending
 // a line. No grapheme is wider than graphemeInfo::maxWidth columns or shorter than one QChar, and printable
 // ASCII (which excludes LineFeed and Tab) is one column per QChar.
-bool fitsUnwrapped(const QString& lineText, const qsizetype widthAvailable)
+bool fitsUnwrapped(const QString& lineText, const qsizetype widthAvailable, const QPointer<Host>& host)
 {
     if (lineText.size() * graphemeInfo::maxWidth <= widthAvailable) {
         return !lineText.contains(QChar::LineFeed);
     }
-    return lineText.size() <= widthAvailable && lineBreakInfo::printableAscii(lineText);
+    if (lineText.size() <= widthAvailable) {
+        if (lineBreakInfo::printableAscii(lineText)) {
+            return true;
+        }
+    } else if (widthAvailable < 0 || lineBreakInfo::printableAscii(QStringView(lineText).first(widthAvailable + 1))) {
+        return false;
+    }
+    return codePointColumnsFit(lineText, widthAvailable, host);
 }
 
 // Asks for the cache line holding the allocator's bookkeeping for a heap block,
@@ -558,7 +601,7 @@ QList<RawQueryParameter> splitOscQueryParameters(const QString& query)
 bool systemMayOpenUrl(const QUrl& url)
 {
     const QString scheme = url.scheme().toLower();
-    return scheme == qsl("http") || scheme == qsl("https") || scheme == qsl("ftp");
+    return scheme == qsl("http") || scheme == qsl("https") || scheme == qsl("ftp") || scheme == qsl("mailto");
 }
 
 } // anonymous namespace
@@ -586,7 +629,6 @@ bool TChar::operator==(const TChar& other) const
 }
 
 namespace {
-// A selected run stays per character, as copying the shared TChar back out would deselect it
 bool storableAsOne(const std::vector<TChar>& chars)
 {
     if (chars.empty() || chars.front().isSelected()) {
@@ -622,9 +664,52 @@ TLineFormat::TLineFormat(const std::vector<TChar>& chars)
 std::vector<TChar>& TLineFormat::expand()
 {
     if (mUniformCount) {
+        // assign() copies, and a copied TChar is deselected
+        const bool selected = mUniform.isSelected();
         mChars.assign(std::exchange(mUniformCount, 0), mUniform);
+        if (selected) {
+            for (TChar& character : mChars) {
+                character.select();
+            }
+        }
     }
     return mChars;
+}
+
+void TLineFormat::select(const size_type from, const size_type to)
+{
+    if (from >= to) {
+        return;
+    }
+    if (mUniformCount && from == 0 && to == mUniformCount) {
+        mUniform.select();
+        return;
+    }
+    std::vector<TChar>& chars = expand();
+    for (TChar& character : std::span(chars).subspan(from, to - from)) {
+        character.select();
+    }
+}
+
+void TLineFormat::deselect()
+{
+    if (mUniformCount) {
+        mUniform.deselect();
+        return;
+    }
+    bool wasSelected = false;
+    for (TChar& character : mChars) {
+        if (character.isSelected()) {
+            character.deselect();
+            wasSelected = true;
+        }
+    }
+    if (wasSelected && storableAsOne(mChars)) {
+        mUniform = mChars.front();
+        mUniformCount = mChars.size();
+        // clear() would keep the heap block
+        std::vector<TChar>().swap(mChars);
+    }
 }
 
 void TLineFormat::insert(const size_type index, const size_type count, const TChar& format)
@@ -1238,18 +1323,22 @@ void TBuffer::dropStateOfRemovedLinks()
 }
 
 // Line numbers here count every line ever removed, so they stay put as the buffer is trimmed
-void TBuffer::noteRemovedLinkId(const int id, const qint64 lastLine)
+void TBuffer::noteRemovedLinkId(const int id, const qint64 lastLine, const bool tell)
 {
     // Once the store has wrapped, an id handed out again further down belongs to that newer
     // link, and recording it would make every trim of a link-dense buffer rescan the buffer.
     // The focused id is always recorded, as that newer link may never have reached the buffer.
     if (id == mCurrentFocusedLinkIndex || mLinkIdIssuedAtLine.value(id, -1) <= lastLine) {
         mLinkIdsRemovedSinceSweep.insert(id);
+        // Every time, not just the first: a link that runs over two lines goes with the last of them
+        if (tell) {
+            noteLinkChanged(id);
+        }
     }
 }
 
 // to < 0 runs to the end of the line
-void TBuffer::noteRemovedLinks(const TLineFormat& line, const qint64 lineNumber, const int from, const int to)
+void TBuffer::noteRemovedLinks(const TLineFormat& line, const qint64 lineNumber, const int from, const int to, const bool tell)
 {
     if (mLinkStore.pristine()) {
         return;
@@ -1259,7 +1348,7 @@ void TBuffer::noteRemovedLinks(const TLineFormat& line, const qint64 lineNumber,
     for (int x = from; x < end; ++x) {
         const int id = line[x].linkIndex();
         if (id && id != previousId) {
-            noteRemovedLinkId(id, lineNumber);
+            noteRemovedLinkId(id, lineNumber, tell);
             previousId = id;
         }
     }
@@ -1423,6 +1512,13 @@ void TBuffer::translateToPlainText(std::string& incoming, const bool isFromServe
         translateToPlainTextInner(incoming, true);
         return;
     }
+
+    const bool enclosingReadingLocalText = mpHost && mpHost->mMxpProcessor.setReadingLocalText(true);
+    auto endLocalText = qScopeGuard([this, enclosingReadingLocalText] {
+        if (mpHost) {
+            mpHost->mMxpProcessor.setReadingLocalText(enclosingReadingLocalText);
+        }
+    });
 
     if (mProcessingLocalFeed) {
         // Text a trigger or an MXP tag feeds while the enclosing feed is still
@@ -1724,18 +1820,8 @@ void TBuffer::parseChunk(
                 // because ANSI escape sequences cannot be part of MXP tags.
                 // Output the partial tag as literal text before processing ESC.
                 if (mxpProcessorEnabled() && mpHost->mMxpProcessor.getMxpTagBuilder().isInsideTag()) {
-                    TChar::AttributeFlags attributeFlags = computeCurrentAttributeFlags();
-                    attributeFlags &= ~(TChar::FastBlink | TChar::Concealed | TChar::AltFontMask);
-                    TChar c((!mIsDefaultColor && mBold) ? mForeGroundColorLight : mForeGroundColor, mBackGroundColor, attributeFlags);
-
-                    const QString literalText = mpHost->mMxpProcessor.abortCurrentTag();
-                    mMudLine.append(literalText);
-                    for (int i = 0; i < literalText.length(); ++i) {
-                        mMudBuffer.append(1, c);
-                    }
-
-                    mTagWatchdog->stop();
-                    mWatchdogPhase = WatchdogPhase::None;
+                    appendMxpText(mpHost->mMxpProcessor.abortCurrentTag());
+                    stopTagWatchdog();
                 }
 
                 mGotESC = true;
@@ -2168,10 +2254,7 @@ void TBuffer::parseChunk(
                     // The comparison signals to the processor, if custom entities may be resolved
                     // (countermeasure against infinite recursion)
                     TMxpProcessingResult const result = mpHost->mMxpProcessor.processMxpInput(ch, localBufferPosition >= endOfMXPEntity);
-                    if (!mTagWatchdog->isActive() && mpHost->mMxpProcessor.getMxpTagBuilder().isInsideTag() && !mpHost->mMxpProcessor.getMxpTagBuilder().getRawTagContent().empty()) {
-                        mWatchdogPhase = WatchdogPhase::Phase1_Snapshot;
-                        mTagWatchdog->start(MAX_TAG_TIMEOUT_MS);
-                    }
+                    watchMxpTag(result == HANDLER_INSERT_ENTITY_SYS || result == HANDLER_INSERT_AND_REPROCESS);
 
                     switch (result) {
                     case HANDLER_NEXT_CHAR:
@@ -2229,17 +2312,7 @@ void TBuffer::parseChunk(
                     case HANDLER_INSERT_ENTITY_SYS: {
                         // System entities are literal QString / UTF values which we just 'print'
                         // There is no further MXP or Codeset evaluation
-
-                        TChar::AttributeFlags attributeFlags = computeCurrentAttributeFlags();
-                        attributeFlags &= ~(TChar::FastBlink | TChar::Concealed | TChar::AltFontMask);
-                        TChar c((!mIsDefaultColor && mBold) ? mForeGroundColorLight : mForeGroundColor, mBackGroundColor, attributeFlags);
-
-                        size_t valueLength = mpHost->mMxpProcessor.getEntityValue().length();
-                        mMudLine.append(mpHost->mMxpProcessor.getEntityValue());
-                        // We also need to set the color attributes for the special character
-                        while (valueLength--) {
-                            mMudBuffer.append(1, c);
-                        }
+                        appendMxpText(mpHost->mMxpProcessor.getEntityValue());
                         // We already handled the input, go to the next character
                         localBufferPosition++;
                         continue;
@@ -2249,16 +2322,7 @@ void TBuffer::parseChunk(
                         // Used for error recovery: output the rejected/incomplete tag as literal
                         // text, then reprocess the current character (which may be a newline,
                         // an ANSI escape, or the character after an unrecognized tag name)
-
-                        TChar::AttributeFlags attributeFlags = computeCurrentAttributeFlags();
-                        attributeFlags &= ~(TChar::FastBlink | TChar::Concealed | TChar::AltFontMask);
-                        TChar c((!mIsDefaultColor && mBold) ? mForeGroundColorLight : mForeGroundColor, mBackGroundColor, attributeFlags);
-
-                        size_t valueLength = mpHost->mMxpProcessor.getEntityValue().length();
-                        mMudLine.append(mpHost->mMxpProcessor.getEntityValue());
-                        while (valueLength--) {
-                            mMudBuffer.append(1, c);
-                        }
+                        appendMxpText(mpHost->mMxpProcessor.getEntityValue());
                         // Do NOT increment position - the current character needs to be reprocessed
                         continue;
                     }
@@ -2270,6 +2334,7 @@ void TBuffer::parseChunk(
                     // Mode is LOCKED but we're inside a tag that started in a different mode.
                     // We need to continue feeding characters to the tag builder to complete the tag.
                     TMxpProcessingResult const result = mpHost->mMxpProcessor.processMxpInput(ch, localBufferPosition >= endOfMXPEntity);
+                    watchMxpTag(result == HANDLER_INSERT_ENTITY_SYS || result == HANDLER_INSERT_AND_REPROCESS);
 
                     switch (result) {
                     case HANDLER_NEXT_CHAR:
@@ -2277,28 +2342,12 @@ void TBuffer::parseChunk(
                         continue;
                     case HANDLER_INSERT_ENTITY_SYS: {
                         // Tag was not handled, output as text
-                        TChar::AttributeFlags attributeFlags = computeCurrentAttributeFlags();
-                        attributeFlags &= ~(TChar::FastBlink | TChar::Concealed | TChar::AltFontMask);
-                        TChar c((!mIsDefaultColor && mBold) ? mForeGroundColorLight : mForeGroundColor, mBackGroundColor, attributeFlags);
-
-                        size_t valueLength = mpHost->mMxpProcessor.getEntityValue().length();
-                        mMudLine.append(mpHost->mMxpProcessor.getEntityValue());
-                        while (valueLength--) {
-                            mMudBuffer.append(1, c);
-                        }
+                        appendMxpText(mpHost->mMxpProcessor.getEntityValue());
                         localBufferPosition++;
                         continue;
                     }
                     case HANDLER_INSERT_AND_REPROCESS: {
-                        TChar::AttributeFlags attributeFlags = computeCurrentAttributeFlags();
-                        attributeFlags &= ~(TChar::FastBlink | TChar::Concealed | TChar::AltFontMask);
-                        TChar c((!mIsDefaultColor && mBold) ? mForeGroundColorLight : mForeGroundColor, mBackGroundColor, attributeFlags);
-
-                        size_t valueLength = mpHost->mMxpProcessor.getEntityValue().length();
-                        mMudLine.append(mpHost->mMxpProcessor.getEntityValue());
-                        while (valueLength--) {
-                            mMudBuffer.append(1, c);
-                        }
+                        appendMxpText(mpHost->mMxpProcessor.getEntityValue());
                         continue;
                     }
                     default:
@@ -2314,7 +2363,15 @@ void TBuffer::parseChunk(
                 // after a newline (but not a <br>) return to default mode
                 // BUT only if we're not in the middle of parsing a tag (tags can span lines)
                 if (!mpHost->mMxpProcessor.getMxpTagBuilder().isInsideTag()) {
-                    mpHost->mMxpProcessor.resetToDefaultMode();
+                    // Any line end the game sends but cTelnet's flush marker uses up a <NOBR>; only a newline is ignored
+                    const bool noBreak = isFromServer && ch != CHAR_CARRIAGE_RETURN && mpHost->mMxpProcessor.takeIgnoredNewline();
+                    const bool ignoreNewline = noBreak && ch == CHAR_NEW_LINE;
+                    // The line still ends for the line modes, so a secure line cannot run on into the next one
+                    mpHost->mMxpProcessor.resetToDefaultMode(!ignoreNewline);
+                    if (ignoreNewline) {
+                        localBufferPosition++;
+                        continue;
+                    }
                 }
             }
         }
@@ -2941,6 +2998,10 @@ void TBuffer::commitLineData(QString line, TLineFormat chars, const char ch)
         }
         // A commit re-entered from a pass (feedTriggers(), MXP) fills the empty last line, which may be
         // the one the enclosing pass is still running over:
+        if (static_cast<int>(buffer.size()) - 1 == mPreTriggerPassLineNumber) {
+            mTriggerPassLineTaken = true;
+        }
+        triggerPassSegmentTaken(static_cast<int>(buffer.size()) - 1);
         materialisePreTriggerPassLine(static_cast<int>(buffer.size()) - 1);
         buffer.back() = std::move(chars);
         timeBuffer.back() = lineArrivalTime();
@@ -2969,8 +3030,12 @@ void TBuffer::commitLineData(QString line, TLineFormat chars, const char ch)
         }
     }
     const int lineIndex = lineBuffer.size() - 1;
+    if (auto* pHyperlinkManager = hyperlinkVisibilityManagerOrNull()) {
+        pHyperlinkManager->anchorLinksAwaitingTheirLine(lineIndex);
+    }
     if (Q_LIKELY(mpModel)) {
         mpModel->endPrintedLine();
+        ++mpModel->mLinesCommitted;
         emit mpModel->mNotifier.lineCommitted(lineIndex);
     }
     mCommitLineIndices.append(lineIndex);
@@ -2984,6 +3049,10 @@ void TBuffer::commitLineData(QString line, TLineFormat chars, const char ch)
         mSelectionStylingFromLine = (mSelectionStylingFromLine < 0) ? lineIndex : std::min(mSelectionStylingFromLine, lineIndex);
     }
     int passLineAfterTriggers = lineIndex;
+    int shownFirst = lineIndex;
+    int shownLast = lineIndex;
+    bool passRan = false;
+    bool passLineTaken = false;
     if (!mSkipTriggerProcessing) {
         // Color triggers match the colors as received, so a line recolored earlier in the pass keeps its
         // originals; materialisePreTriggerPassLine() copies them lazily as most lines are never touched.
@@ -2993,14 +3062,18 @@ void TBuffer::commitLineData(QString line, TLineFormat chars, const char ch)
         // Save/restore gives each nested pass its own snapshot; the spare member recycles its allocation:
         TLineFormat savedPassLine;
         savedPassLine.swap(mPreTriggerPassLine);
-        mEnclosingTriggerPasses.append({mPreTriggerPassLineNumber, std::exchange(mDetachedTriggerPassLineText, QString()), std::exchange(mTriggerPassLineEdits, {})});
+        mEnclosingTriggerPasses.append(
+                {mPreTriggerPassLineNumber, std::exchange(mDetachedTriggerPassLineText, QString()), std::exchange(mTriggerPassLineEdits, {}), mTriggerPassLineLastSegment, mTriggerPassLineTailFrom});
         const int savedPassLineAsCommitted = mTriggerPassLineAsCommitted;
         const bool savedPassSnapshotTaken = mPreTriggerPassSnapshotTaken;
         const PassLineUniformity savedPassLineUniformity = mPreTriggerPassLineUniformity;
+        const bool savedPassLineTaken = std::exchange(mTriggerPassLineTaken, false);
         mPreTriggerPassLine.swap(mSpareTriggerPassLine);
         mPreTriggerPassLine.clear();
         mPreTriggerPassSnapshotTaken = false;
         mPreTriggerPassLineNumber = lineIndex;
+        mTriggerPassLineLastSegment = lineIndex;
+        mTriggerPassLineTailFrom = -1;
         mTriggerPassLineAsCommitted = lineIndex;
         mPreTriggerPassLineUniformity = PassLineUniformity::Unknown;
 #ifndef QT_NO_DEBUG
@@ -3017,6 +3090,10 @@ void TBuffer::commitLineData(QString line, TLineFormat chars, const char ch)
         }
 #endif
         passLineAfterTriggers = (mPreTriggerPassLineNumber >= 0) ? mPreTriggerPassLineNumber : lineIndex;
+        // Followed through wraps, which mCommitLineIndices is not
+        passRan = true;
+        shownFirst = triggerPassSpanFirst(mPreTriggerPassLineNumber, mTriggerPassLineTailFrom);
+        shownLast = (shownFirst >= 0) ? std::max(mTriggerPassLineLastSegment, shownFirst) : -1;
         mSpareTriggerPassLine.swap(mPreTriggerPassLine);
         if (mSpareTriggerPassLine.capacity() > csmMaxRetainedLineCapacity) {
             TLineFormat().swap(mSpareTriggerPassLine);
@@ -3024,11 +3101,18 @@ void TBuffer::commitLineData(QString line, TLineFormat chars, const char ch)
         mPreTriggerPassLine.swap(savedPassLine);
         EnclosingTriggerPass enclosing = mEnclosingTriggerPasses.takeLast();
         mPreTriggerPassLineNumber = enclosing.lineNumber;
+        mTriggerPassLineLastSegment = enclosing.lastSegment;
+        mTriggerPassLineTailFrom = enclosing.tailFrom;
         mDetachedTriggerPassLineText = std::move(enclosing.detachedText);
         mTriggerPassLineEdits = std::move(enclosing.edits);
         mTriggerPassLineAsCommitted = savedPassLineAsCommitted;
         mPreTriggerPassSnapshotTaken = savedPassSnapshotTaken;
         mPreTriggerPassLineUniformity = savedPassLineUniformity;
+        passLineTaken = std::exchange(mTriggerPassLineTaken, savedPassLineTaken);
+    }
+    if (Q_LIKELY(mpModel) && Q_UNLIKELY(mpModel->mNotifier.lineShownConnected())) {
+        const bool shown = (passRan ? shownFirst >= 0 : mCommitLineIndices.last() >= 0) && !passLineTaken;
+        emit mpModel->mNotifier.lineShown(shown ? shownFirst : -1, shown ? shownLast : -1);
     }
 
     // NOTE: it MAY have been clobbered by the trigger engine!
@@ -3042,7 +3126,7 @@ void TBuffer::commitLineData(QString line, TLineFormat chars, const char ch)
     // Spares wrapLine()'s setup for the usual last line that fits; one with no text or no TChars still goes
     // through, as wrapLine() rebuilds it. The width must not exceed getWrapInfo()'s widthAvailable for mWrapAt.
     const bool fitsAsIs = wrapStartLine == lastValidLine && !lineBuffer.at(wrapStartLine).isEmpty() && !buffer[wrapStartLine].empty()
-                          && fitsUnwrapped(lineBuffer.at(wrapStartLine), wrapsFromPreviousLine(wrapStartLine) ? mWrapAt : mWrapAt - clampedWrapIndent(mWrapIndent, mWrapAt));
+                          && fitsUnwrapped(lineBuffer.at(wrapStartLine), wrapsFromPreviousLine(wrapStartLine) ? mWrapAt : mWrapAt - clampedWrapIndent(mWrapIndent, mWrapAt), mpHost);
     const int addedLines = fitsAsIs ? 0 : wrapLine(wrapStartLine, mWrapAt, mWrapIndent, mWrapHangingIndent);
     // The line feed ended this line, so an empty wrapped line left by the
     // spaces it ended on is where the next line starts, not more of this one
@@ -3305,6 +3389,7 @@ void TBuffer::joinPendingServerWrapOntoCurrent()
         maskSpoilerText(mHeldSpoilerLinkId, mMudLine, mMudBuffer, mHeldSpoilerStartColumn, heldLength - mHeldSpoilerStartColumn + mHeldSpoilerContinuationLength);
         mHeldSpoilerLinkId = 0;
     }
+    mHeldLinkEndedByClear = 0;
     for (const HeldVisibility& held : std::exchange(mHeldVisibilities, {})) {
         if (held.startsAfterHeldText) {
             registerLinkVisibility(held.linkId, held.startColumn + heldLength, held.continuationLength - held.startColumn, held.styling);
@@ -3321,13 +3406,25 @@ void TBuffer::flushPendingServerWrapJoin(const bool endsHyperlink)
     if (mServerWrapPendingLine.isEmpty()) {
         return;
     }
+    const int linkEndingWithHeldText = endsHyperlink ? mHeldLinkEndedByClear : 0;
+    mHeldLinkEndedByClear = 0;
     if (mHeldSpoilerLinkId) {
         maskSpoilerText(mHeldSpoilerLinkId, mServerWrapPendingLine, mServerWrapPendingBuffer, mHeldSpoilerStartColumn, mServerWrapPendingLine.size() - mHeldSpoilerStartColumn);
-        maskSpoilerText(mHeldSpoilerLinkId, mMudLine, mMudBuffer, 0, mHeldSpoilerContinuationLength);
+        if (mHeldSpoilerLinkId != linkEndingWithHeldText) {
+            maskSpoilerText(mHeldSpoilerLinkId, mMudLine, mMudBuffer, 0, mHeldSpoilerContinuationLength);
+        }
         mHeldSpoilerLinkId = 0;
     }
+    if (linkEndingWithHeldText) {
+        for (auto& c : mMudBuffer.expand()) {
+            if (c.mLinkIndex == linkEndingWithHeldText) {
+                c.mLinkIndex = 0;
+            }
+        }
+    }
     // A link closed after the held text sits whole on the line after it, at the columns it recorded;
-    // one that began in the held text now spans two lines, which visibility does not cover.
+    // one that began in the held text now spans two lines, which visibility does not cover, unless
+    // clear() ended it, which leaves it on the held line alone.
     const QList<HeldVisibility> heldVisibilities = std::exchange(mHeldVisibilities, {});
     const bool linkStartsAfterHeldText = mHyperlinkActive && mCurrentHyperlinkStartsAfterHeldText;
     if (mHyperlinkActive && !linkStartsAfterHeldText) {
@@ -3354,6 +3451,17 @@ void TBuffer::flushPendingServerWrapJoin(const bool endsHyperlink)
             carryActiveHyperlinkPastFlush(mServerWrapPendingLine, mServerWrapPendingBuffer);
         }
     }
+    for (const HeldVisibility& held : heldVisibilities) {
+        if (held.linkId == linkEndingWithHeldText && !held.startsAfterHeldText) {
+            mMudLine.swap(mServerWrapPendingLine);
+            registerLinkVisibility(held.linkId, held.startColumn, static_cast<int>(mMudLine.size()) - held.startColumn, held.styling);
+            mMudLine.swap(mServerWrapPendingLine);
+            // A script's echo() since the clear may sit on the last line, so let the commit place it
+            if (auto* pHyperlinkManager = hyperlinkVisibilityManagerOrNull()) {
+                pHyperlinkManager->trackAwaitingTheirLine(pHyperlinkManager->takeLinks({held.linkId}));
+            }
+        }
+    }
     QString line;
     TLineFormat chars;
     line.swap(mServerWrapPendingLine);
@@ -3375,6 +3483,27 @@ void TBuffer::flushPendingServerWrapJoin(const bool endsHyperlink)
 void TBuffer::triggerPassLinesRemoved(const int from, const int to)
 {
     const int delta = to - from + 1;
+    const auto moveLastSegment = [from, to, delta](int& lastSegment) {
+        if (lastSegment > to) {
+            lastSegment -= delta;
+        } else if (lastSegment >= from) {
+            lastSegment = from - 1;
+        }
+    };
+    // Read before the last segment moves: the rest of the line starts at from once its first part goes
+    const auto moveTail = [from, to, delta](const int passLine, int& tailFrom, const int lastSegment) {
+        if (tailFrom > to) {
+            tailFrom -= delta;
+        } else if (tailFrom >= from || (passLine >= from && passLine <= to)) {
+            tailFrom = (lastSegment > to) ? from : -1;
+        }
+    };
+    moveTail(mPreTriggerPassLineNumber, mTriggerPassLineTailFrom, mTriggerPassLineLastSegment);
+    moveLastSegment(mTriggerPassLineLastSegment);
+    for (EnclosingTriggerPass& enclosing : mEnclosingTriggerPasses) {
+        moveTail(enclosing.lineNumber, enclosing.tailFrom, enclosing.lastSegment);
+        moveLastSegment(enclosing.lastSegment);
+    }
     if (mPreTriggerPassLineNumber > to) {
         mPreTriggerPassLineNumber -= delta;
     } else if (mPreTriggerPassLineNumber >= from) {
@@ -3398,6 +3527,36 @@ void TBuffer::triggerPassLinesRemoved(const int from, const int to)
             enclosing.detachedText = lineBuffer.at(enclosing.lineNumber);
             enclosing.lineNumber = csmDetachedTriggerPassLine;
         }
+    }
+}
+
+bool TBuffer::triggerPassRunningOn(const int lineNumber) const
+{
+    if (lineNumber < 0) {
+        return false;
+    }
+    const auto spans = [lineNumber](const int passLine, const int lastSegment) {
+        return passLine >= 0 && lineNumber >= passLine && lineNumber <= std::max(passLine, lastSegment);
+    };
+    if (spans(triggerPassSpanFirst(mPreTriggerPassLineNumber, mTriggerPassLineTailFrom), mTriggerPassLineLastSegment)) {
+        return true;
+    }
+    return std::any_of(mEnclosingTriggerPasses.cbegin(), mEnclosingTriggerPasses.cend(), [&spans](const EnclosingTriggerPass& enclosing) {
+        return spans(triggerPassSpanFirst(enclosing.lineNumber, enclosing.tailFrom), enclosing.lastSegment);
+    });
+}
+
+// A line fed from inside a pass fills the empty line a wrap left last, which then ends no pass line
+void TBuffer::triggerPassSegmentTaken(const int lineNumber)
+{
+    const auto shorten = [lineNumber](const int passLine, int& lastSegment) {
+        if (passLine >= 0 && lineNumber > passLine && lineNumber <= lastSegment) {
+            lastSegment = lineNumber - 1;
+        }
+    };
+    shorten(triggerPassSpanFirst(mPreTriggerPassLineNumber, mTriggerPassLineTailFrom), mTriggerPassLineLastSegment);
+    for (EnclosingTriggerPass& enclosing : mEnclosingTriggerPasses) {
+        shorten(triggerPassSpanFirst(enclosing.lineNumber, enclosing.tailFrom), enclosing.lastSegment);
     }
 }
 
@@ -3557,15 +3716,20 @@ const TChar* TBuffer::preTriggerPassLineUniformColors(int lineNumber)
 void TBuffer::processMxpWatchdogCallback()
 {
     if (!mpHost) {
-        mWatchdogPhase = WatchdogPhase::None;
+        stopTagWatchdog();
         return;
     }
 
     TMxpNodeBuilder& tagBuilder = mpHost->mMxpProcessor.getMxpTagBuilder();
     std::string currentTagContent = tagBuilder.getRawTagContent();
-    bool isMxpParserFrozen = !currentTagContent.empty() && currentTagContent.starts_with(mWatchdogTagSnapshot) && tagBuilder.isInsideTag();
+    // An empty snapshot would match whatever tag is open by the second phase
+    bool isMxpParserFrozen = !mWatchdogTagSnapshot.empty() && currentTagContent.starts_with(mWatchdogTagSnapshot) && tagBuilder.isInsideTag();
 
     if (mWatchdogPhase == WatchdogPhase::Phase1_Snapshot) {
+        if (!tagBuilder.isInsideTag() || currentTagContent.empty()) {
+            stopTagWatchdog();
+            return;
+        }
         mWatchdogTagSnapshot = currentTagContent;
         mWatchdogPhase = WatchdogPhase::Phase2_Unfreeze;
         mTagWatchdog->start(MAX_TAG_TIMEOUT_MS);
@@ -3575,7 +3739,6 @@ void TBuffer::processMxpWatchdogCallback()
         // unless there is no main window to have made one:
         if (isMxpParserFrozen && (mpHost->hasConsoleView() || !TAppFrontend::hasView()) && mpModel == &mpHost->mainConsoleModel()) {
             mpHost->mMxpProcessor.setLastEntityValue(QString::fromStdString('<' + currentTagContent));
-            const TChar style(mForeGroundColor, mBackGroundColor, computeCurrentAttributeFlags());
             QPointer<Host> hostGuard = mpHost;
             // The continuation writes into this buffer through the captured
             // 'this', so what has to cancel it is this buffer going away - not
@@ -3583,31 +3746,61 @@ void TBuffer::processMxpWatchdogCallback()
             // watchdog timer is owned by the buffer, so naming it as the context
             // object ties the two together: destroying the buffer destroys the
             // timer, and that drops any continuation still queued against it.
-            QTimer::singleShot(0ms, mTagWatchdog.get(), [this, style, hostGuard]() {
+            QTimer::singleShot(0ms, mTagWatchdog.get(), [this, currentTagContent, hostGuard]() {
                 // commitLine() and finalize() below both reach the main console
                 // through the host, and that pointer empties on its own when the
                 // profile's console goes:
                 if (!hostGuard || (!hostGuard->hasConsoleView() && TAppFrontend::hasView())) {
                     return;
                 }
-                QString lastEntityValue = hostGuard->mMxpProcessor.getEntityValue();
+                // Game text read before this ran may have finished the tag, or moved it on
+                const TMxpNodeBuilder& tagBuilder = hostGuard->mMxpProcessor.getMxpTagBuilder();
+                if (!tagBuilder.isInsideTag()) {
+                    return;
+                }
+                if (tagBuilder.getRawTagContent() != currentTagContent) {
+                    mWatchdogPhase = WatchdogPhase::Phase1_Snapshot;
+                    mTagWatchdog->start(MAX_TAG_TIMEOUT_MS);
+                    return;
+                }
                 size_t unusedBufferPosition = 0;
 
-                mMudLine.append(lastEntityValue);
-                for (qsizetype i = 0; i < lastEntityValue.size(); ++i) {
-                    mMudBuffer.append(1, style);
-                }
+                // Closed before the commit, as triggers on the line may feed more text through the parser
+                appendMxpText(hostGuard->mMxpProcessor.abortCurrentTag());
                 // In trigger context, as for every other line the game sends
                 const bool wasInTriggerEngineMode = mpModel->mTriggerEngineMode;
                 mpModel->mTriggerEngineMode = true;
                 commitLine('\r', unusedBufferPosition);
                 mpModel->mTriggerEngineMode = wasInTriggerEngineMode;
-                hostGuard->mMxpProcessor.getMxpTagBuilder().reset();
                 hostGuard->finalizeMainConsole();
             });
         }
         mWatchdogPhase = WatchdogPhase::None;
+        mWatchdogTagSnapshot.clear();
     }
+}
+
+// Stops the tag watchdog once its tag is closed or written out - left armed, it
+// would fire on whichever tag is open when it runs out - and arms it for the next.
+void TBuffer::watchMxpTag(const bool tagWrittenOut)
+{
+    const TMxpNodeBuilder& tagBuilder = mpHost->mMxpProcessor.getMxpTagBuilder();
+    const bool insideTag = tagBuilder.isInsideTag();
+    // A nested '<' writes the tag out and opens a new one in the same step
+    if (mWatchdogPhase != WatchdogPhase::None && (!insideTag || tagWrittenOut)) {
+        stopTagWatchdog();
+    }
+    if (insideTag && !mTagWatchdog->isActive() && !tagBuilder.getRawTagContent().empty()) {
+        mWatchdogPhase = WatchdogPhase::Phase1_Snapshot;
+        mTagWatchdog->start(MAX_TAG_TIMEOUT_MS);
+    }
+}
+
+void TBuffer::stopTagWatchdog()
+{
+    mTagWatchdog->stop();
+    mWatchdogPhase = WatchdogPhase::None;
+    mWatchdogTagSnapshot.clear();
 }
 
 TChar::AttributeFlags TBuffer::computeCurrentAttributeFlags() const
@@ -5028,7 +5221,7 @@ void TBuffer::decodeOSC(const QString& sequence)
 
             QString baseUrl = rawUrl;
 
-            if (rawUrl.startsWith(qsl("http://")) || rawUrl.startsWith(qsl("https://")) || rawUrl.startsWith(qsl("ftp://"))) {
+            if (systemMayOpenUrl(QUrl(rawUrl))) {
                 int queryStart = baseUrl.indexOf('?');
                 if (queryStart != -1) {
                     // Strip reserved parameters when corresponding OSC 8 features are enabled
@@ -5082,10 +5275,24 @@ void TBuffer::decodeOSC(const QString& sequence)
                 QString scheme = qurl.scheme().toLower();
 
                 if (systemMayOpenUrl(qurl)) {
+                    baseUrl = MailtoUri::withOnlyMessageFields(baseUrl);
+                    if (baseUrl.isEmpty()) {
+                        qWarning().noquote() << "TBuffer::decodeOSC(...) - Ignored a mailto link with a field hidden in a recipient";
+                        return;
+                    }
                     mCurrentHyperlinkStyling.actionScheme = Mudlet::HyperlinkStyling::ActionOpenUrl;
                     mCurrentHyperlinkStyling.baseCommand = baseUrl;
                     command = {qsl("openUrl(%1)").arg(LuaLiteral::quote(baseUrl))};
-                    hint = {qsl("%1: %2").arg(QObject::tr("Open browser to"), UntrustedText::forTarget(baseUrl))};
+                    QString action = QObject::tr("Open browser to");
+                    if (scheme == qsl("mailto")) {
+                        //: Start of the tooltip on a game's link that opens the mail app, followed by a colon and the link's mailto: address
+                        action = QObject::tr("Write an email to");
+                    }
+                    hint = {qsl("%1: %2").arg(action, UntrustedText::forTarget(baseUrl))};
+                } else if ((scheme == qsl("telnet") || scheme == qsl("telnets")) && parseTelnetUri(baseUrl)) {
+                    command = {qsl("connectFromGameLink(%1)").arg(LuaLiteral::quote(baseUrl))};
+                    //: Start of the tooltip on a link from the game to a game's address, which may be the game being played, followed by a colon and that address
+                    hint = {qsl("%1: %2").arg(QObject::tr("Connect to"), UntrustedText::forTarget(baseUrl))};
                 } else {
                     qWarning().noquote().nospace() << "TBuffer::decodeOSC(...) - Ignored untrusted or unsupported URI scheme: \"" << scheme << "\"";
                     return;
@@ -5129,8 +5336,12 @@ void TBuffer::decodeOSC(const QString& sequence)
                         // Special case: "-" creates a menu separator
                         menuCommands.append(QString());
                         menuHints.append(QString());
-                    } else if (systemMayOpenUrl(QUrl(menuCommand))) {
-                        menuCommands.append(qsl("openUrl(%1)").arg(LuaLiteral::quote(menuCommand)));
+                    } else if (const QString address = MailtoUri::withOnlyMessageFields(menuCommand); systemMayOpenUrl(QUrl(address))) {
+                        menuCommands.append(qsl("openUrl(%1)").arg(LuaLiteral::quote(address)));
+                        menuHints.append(UntrustedText::forAuthoredText(menuLabel));
+                    } else if (const QString menuScheme = QUrl(menuCommand).scheme().toLower(); menuScheme == qsl("telnet") || menuScheme == qsl("telnets")) {
+                        // One Mudlet could not connect to stays in the menu with nothing to run, so it shows greyed out
+                        menuCommands.append(parseTelnetUri(menuCommand) ? qsl("connectFromGameLink(%1)").arg(LuaLiteral::quote(menuCommand)) : QString());
                         menuHints.append(UntrustedText::forAuthoredText(menuLabel));
                     } else {
                         // Treat as direct command
@@ -5191,13 +5402,16 @@ void TBuffer::decodeOSC(const QString& sequence)
                 setLinkSelected(mCurrentHyperlinkLinkId, mCurrentHyperlinkStyling.selection.selected);
                 if (mCurrentHyperlinkStyling.selection.selected) {
                     setLinkState(mCurrentHyperlinkLinkId, Mudlet::HyperlinkStyling::StateSelected);
-                } else if (mCurrentHyperlinkStyling.selection.disabled) {
-                    setLinkState(mCurrentHyperlinkLinkId, Mudlet::HyperlinkStyling::StateDisabled);
                 }
 #if defined(DEBUG_OSC_PROCESSING)
                 qDebug() << "[OSC] Link" << mCurrentHyperlinkLinkId << "initialized with selection state:" << "group=" << group << "value=" << value
                          << "selected=" << mCurrentHyperlinkStyling.selection.selected << "disabled=" << mCurrentHyperlinkStyling.selection.disabled;
 #endif
+            }
+
+            // Here and not when it closes: its characters take this state as they are built, and outrank being selected
+            if (mCurrentHyperlinkStyling.selection.disabled) {
+                setLinkState(mCurrentHyperlinkLinkId, Mudlet::HyperlinkStyling::StateDisabled);
             }
 
 #if defined(DEBUG_OSC_PROCESSING)
@@ -6602,7 +6816,7 @@ inline QList<WrapInfo> TBuffer::getWrapInfo(const QString& lineText, bool isNewl
 
     const bool indentToCome = isNewline && !startsIndented;
     const qsizetype widthAvailable = std::min<qsizetype>(indentToCome ? maxWidth - indent : maxWidth, mWrapAt);
-    if (fitsUnwrapped(lineText, widthAvailable)) {
+    if (fitsUnwrapped(lineText, widthAvailable, mpHost)) {
         return output;
     }
     const bool plainAscii = lineBreakInfo::printableAscii(lineText);
@@ -6678,9 +6892,8 @@ inline QList<WrapInfo> TBuffer::getWrapInfo(const QString& lineText, bool isNewl
         int charWidth = 1;
         if (!plainAscii) {
             nextBoundary = graphemeFinder->toNextBoundary();
-            const uint unicode = graphemeInfo::getBaseCharacter(QStringView(lineText).mid(indexOfChar, nextBoundary - indexOfChar));
             // Safety check: during destruction, mpHost might be null
-            charWidth = graphemeInfo::getWidth(unicode, mpHost ? mpHost->wideAmbiguousEAsianGlyphs() : false);
+            charWidth = graphemeInfo::getGraphemeWidth(QStringView(lineText).mid(indexOfChar, nextBoundary - indexOfChar), mpHost ? mpHost->wideAmbiguousEAsianGlyphs() : false);
         }
         const int indentationHere = isNewline ? indent : hangingIndent;
         if (xPos + charWidth > maxWidth - (needsIndent ? indentationHere : 0)) {
@@ -6742,7 +6955,7 @@ inline QList<WrapInfo> TBuffer::getWrapInfo(const QString& lineText, bool isNewl
             const bool wideAmbiguous = mpHost->wideAmbiguousEAsianGlyphs();
             for (int position = 0; position < textEnd && width <= mWrapAt;) {
                 const int next = graphemeFinder->toNextBoundary();
-                width += graphemeInfo::getWidth(graphemeInfo::getBaseCharacter(QStringView(lineText).mid(position, next - position)), wideAmbiguous);
+                width += graphemeInfo::getGraphemeWidth(QStringView(lineText).mid(position, next - position), wideAmbiguous);
                 position = next;
             }
         }
@@ -6973,11 +7186,34 @@ int TBuffer::wrapLine(int startLine, int maxWidth, int indentSize, int hangingIn
     if (mPreTriggerPassLineNumber >= firstRewrappedLine) {
         passLines.append({&mPreTriggerPassLineNumber, mPreTriggerPassLineNumber});
     }
+    if (mTriggerPassLineTailFrom >= firstRewrappedLine) {
+        passLines.append({&mTriggerPassLineTailFrom, mTriggerPassLineTailFrom});
+    }
     for (EnclosingTriggerPass& enclosing : mEnclosingTriggerPasses) {
         if (enclosing.lineNumber >= firstRewrappedLine) {
             passLines.append({&enclosing.lineNumber, enclosing.lineNumber});
         }
+        if (enclosing.tailFrom >= firstRewrappedLine) {
+            passLines.append({&enclosing.tailFrom, enclosing.tailFrom});
+        }
     }
+    // and its last segment to where the last part of the line it was lands, so a pass line split here keeps its parts
+    QVarLengthArray<MovingPassLine, 2> lastSegments;
+    if (mTriggerPassLineLastSegment >= firstRewrappedLine) {
+        lastSegments.append({&mTriggerPassLineLastSegment, mTriggerPassLineLastSegment});
+    }
+    for (EnclosingTriggerPass& enclosing : mEnclosingTriggerPasses) {
+        if (enclosing.lastSegment >= firstRewrappedLine) {
+            lastSegments.append({&enclosing.lastSegment, enclosing.lastSegment});
+        }
+    }
+    const auto moveLastSegmentsOf = [&lastSegments, firstRewrappedLine](const int sourceLine, const int rewrappedSoFar) {
+        for (const MovingPassLine& lastSegment : std::as_const(lastSegments)) {
+            if (lastSegment.from == sourceLine) {
+                *lastSegment.pLineNumber = firstRewrappedLine + rewrappedSoFar - 1;
+            }
+        }
+    };
 
     struct RewrappedLine
     {
@@ -6989,9 +7225,17 @@ int TBuffer::wrapLine(int startLine, int maxWidth, int indentSize, int hangingIn
     };
     // Most calls rewrap a single incoming line into a few, which fit in this array's own inline storage
     QVarLengthArray<RewrappedLine, 8> rewrapped;
+    const bool movesHeld = mpModel && mpModel->holdsForLineShown();
+    QList<TConsoleModel::RewrappedSpan> heldSpans;
+    const auto keepWholeForHeld = [movesHeld, &heldSpans, &rewrapped, firstRewrappedLine](const int sourceLine) {
+        if (movesHeld) {
+            heldSpans.append({sourceLine, 0, std::numeric_limits<int>::max(), firstRewrappedLine + static_cast<int>(rewrapped.size()), 0});
+        }
+    };
     int lineCount = 0;
     for (int i = firstRewrappedLine; i < total; ++i) {
         lineCount++;
+        moveLastSegmentsOf(i - 1, static_cast<int>(rewrapped.size()));
         for (const MovingPassLine& passLine : std::as_const(passLines)) {
             if (passLine.from == i) {
                 *passLine.pLineNumber = firstRewrappedLine + static_cast<int>(rewrapped.size());
@@ -7002,6 +7246,7 @@ int TBuffer::wrapLine(int startLine, int maxWidth, int indentSize, int hangingIn
         const qint64 time = timeBuffer[i];
         // trivial case
         if (buffer[i].empty()) {
+            keepWholeForHeld(i);
             rewrapped.append({std::move(newBufferLine), newLineText, time, wrapGapBuffer.at(i), false});
             continue;
         }
@@ -7022,6 +7267,7 @@ int TBuffer::wrapLine(int startLine, int maxWidth, int indentSize, int hangingIn
             lineBreaks = getWrapInfo(lineText, isNewline, isNewline && carriesIndent(i), maxWidth, indent, hangingIndent);
         }
         if (lineBreaks.isEmpty()) {
+            keepWholeForHeld(i);
             rewrapped.append({std::move(buffer[i]), lineText, time, wrapGapBuffer.at(i), isPrompt});
             continue;
         }
@@ -7079,12 +7325,16 @@ int TBuffer::wrapLine(int startLine, int maxWidth, int indentSize, int hangingIn
             } else if (previousSegmentEnd < 0) {
                 wrapGap = wrapGapBuffer.at(i);
             }
+            if (movesHeld) {
+                heldSpans.append({i, w.firstChar, w.lastChar, firstRewrappedLine + static_cast<int>(rewrapped.size()), addsIndent ? (w.isNewline ? indent : hangingIndent) : 0});
+            }
             rewrapped.append({std::move(newBufferLine), std::move(newLineText), segmentTime, static_cast<quint16>(std::min<int>(wrapGap, std::numeric_limits<quint16>::max())), isPrompt});
             previousSegmentEnd = w.lastChar;
             newBufferLine.clear();
             newLineText = QString();
         }
     }
+    moveLastSegmentsOf(total - 1, static_cast<int>(rewrapped.size()));
     for (int i = 0; i < lineCount; ++i) {
         buffer.pop_back();
         lineBuffer.pop_back();
@@ -7110,6 +7360,10 @@ int TBuffer::wrapLine(int startLine, int maxWidth, int indentSize, int hangingIn
             promptBuffer.push_back(line.prompt);
             wrapGapBuffer.append(line.wrapGap);
         }
+    }
+
+    if (movesHeld) {
+        mpModel->heldForLineShownRewrapped(firstRewrappedLine, heldSpans);
     }
 
     // A rewrapped line only ever lands at or below where it was
@@ -7289,16 +7543,16 @@ void TBuffer::finaliseActiveHyperlink()
 {
     // Apply initial selection/disabled state styling when link closes (from selection branch)
     // OR apply :link pseudo-class styling for preset-only links (from compact branch)
-    if (mCurrentHyperlinkLinkId > 0 && mCurrentHyperlinkStyling.selection.hasSelectionSettings) {
+    if (mCurrentHyperlinkLinkId > 0 && (mCurrentHyperlinkStyling.selection.hasSelectionSettings || mCurrentHyperlinkStyling.selection.disabled)) {
 #if defined(DEBUG_OSC_PROCESSING)
         qDebug() << "[OSC] Queuing initial selection styling for link" << mCurrentHyperlinkLinkId << "selected:" << mCurrentHyperlinkStyling.selection.selected
                  << "disabled:" << mCurrentHyperlinkStyling.selection.disabled << "selectedStyle.hasCustomStyling:" << mCurrentHyperlinkStyling.selectedStyle.hasCustomStyling;
 #endif
-        if (mCurrentHyperlinkStyling.selection.selected) {
-            setLinkState(mCurrentHyperlinkLinkId, Mudlet::HyperlinkStyling::StateSelected);
-            mPendingSelectionStyling.insert(mCurrentHyperlinkLinkId);
-        } else if (mCurrentHyperlinkStyling.selection.disabled) {
+        if (mCurrentHyperlinkStyling.selection.disabled) {
+            // Not queued for restyling: its characters were built in this state, and that would clear the game's own formatting
             setLinkState(mCurrentHyperlinkLinkId, Mudlet::HyperlinkStyling::StateDisabled);
+        } else if (mCurrentHyperlinkStyling.selection.selected) {
+            setLinkState(mCurrentHyperlinkLinkId, Mudlet::HyperlinkStyling::StateSelected);
             mPendingSelectionStyling.insert(mCurrentHyperlinkLinkId);
         }
     } else if (mCurrentHyperlinkLinkId > 0) {
@@ -7402,6 +7656,37 @@ void TBuffer::carryActiveHyperlinkPastFlush(QString& line, const TLineFormat& fo
     mCurrentHyperlinkStartColumn = 0;
 }
 
+// revealSpoilerLink() hands out a spoiler's set-aside text a character at a time
+// in buffer order, so the text of its characters on the lines comes first
+void TBuffer::forgetSpoilerTextOnTheLines(const QSet<int>& linkIds)
+{
+    QHash<int, qsizetype> onTheLines;
+    for (const int linkId : linkIds) {
+        if (mLinkOriginalText.contains(linkId)) {
+            onTheLines.insert(linkId, 0);
+        }
+    }
+    if (onTheLines.isEmpty()) {
+        return;
+    }
+    for (const TLineFormat& line : buffer) {
+        for (const TChar& c : line) {
+            if (const int id = c.linkIndex()) {
+                if (const auto it = onTheLines.find(id); it != onTheLines.end()) {
+                    ++it.value();
+                }
+            }
+        }
+    }
+    for (auto it = onTheLines.cbegin(); it != onTheLines.cend(); ++it) {
+        QString& originalText = mLinkOriginalText[it.key()];
+        originalText.remove(0, it.value());
+        if (originalText.isEmpty()) {
+            mLinkOriginalText.remove(it.key());
+        }
+    }
+}
+
 // Sets a spoiler's text aside and masks it space for space. One spread over
 // several lines is set aside a piece at a time, in the order
 // revealSpoilerLink() restores it. Text not stamped with the spoiler's id, such
@@ -7471,14 +7756,30 @@ void TBuffer::clear()
         lastloggedToLine = -1;
     }
 
+    // A spoiler outliving the lines about to go would otherwise reveal their text over what is left of it
+    QSet<int> outlivingLinkIds = linkIdsOnTheLinesStillToCome();
+    if (mHyperlinkActive) {
+        outlivingLinkIds.insert(mCurrentHyperlinkLinkId);
+    }
+    forgetSpoilerTextOnTheLines(outlivingLinkIds);
+    // The open link ends here, as its close would have ended it
+    if (mHyperlinkActive) {
+        mHeldLinkEndedByClear = !mServerWrapPendingLine.isEmpty() && !mCurrentHyperlinkStartsAfterHeldText ? mCurrentHyperlinkLinkId : 0;
+        finaliseActiveHyperlink();
+    }
     mCurrentHyperlinkCommand.clear();
     mCurrentHyperlinkHint.clear();
     mCurrentHyperlinkLinkId = 0;
     mHyperlinkActive = false;
     mHyperlinkEnclosingMxpLinkId = 0;
 
-    // every line is about to go, so the tracked links and any announcement queued for them go with it
-    if (auto* pHyperlinkManager = hyperlinkVisibilityManagerOrNull()) {
+    // every line is about to go, so the tracked links and any announcement queued for them go with it,
+    // but for those on the line still to come, which lands where it lands only once the game ends it:
+    // a script may print first
+    auto* pHyperlinkManager = hyperlinkVisibilityManagerOrNull();
+    QList<TrackedHyperlink> linksStillToCome;
+    if (pHyperlinkManager) {
+        linksStillToCome = pHyperlinkManager->takeLinks(linkIdsOnTheLinesStillToCome());
         pHyperlinkManager->clear();
     }
 
@@ -7487,9 +7788,12 @@ void TBuffer::clear()
             break;
         }
     }
+    if (pHyperlinkManager) {
+        pHyperlinkManager->trackAwaitingTheirLine(linksStillToCome);
+    }
 
-    // After deleting all lines, clear all links (none are referenced)
-    clearLinkState();
+    // The game's unended or held line, and an open MXP link, carry their ids on past the clear
+    clearLinkState(liveLinkIdsOutsideTheLines());
 
     buffer.emplace_back();
     lineBuffer << QString();
@@ -7510,7 +7814,12 @@ void TBuffer::clearLinkState(const QSet<int>& stillLiveLinkIds)
     const QSet<int> activeLinkIds = collectLiveLinkIdsResettingIssueLines() | stillLiveLinkIds;
 
     if (pH) {
-        mLinkStore.removeUnreferencedLinks(activeLinkIds, pH);
+        const QList<int> removedIds = mLinkStore.removeUnreferencedLinks(activeLinkIds, pH);
+        if (mpModel && mpModel->mNotifier.linkChangedConnected()) {
+            for (const int id : removedIds) {
+                emit mpModel->mNotifier.linkChanged(id);
+            }
+        }
     } else {
         qWarning() << "TBuffer::clearLinkState() WARNING - mpHost is null, cannot remove unreferenced links from store";
     }
@@ -7599,6 +7908,43 @@ QSet<int> TBuffer::collectLiveLinkIdsResettingIssueLines()
     return liveLinkIds;
 }
 
+// A concealed link's characters carry no index, and a link the game is still
+// writing has none in a line yet, so a sweep has to be told of both
+QSet<int> TBuffer::liveLinkIdsOutsideTheLines()
+{
+    QSet<int> ids = mpModel ? mpModel->mHyperlinkVisibilityManager.trackedLinkIds() : QSet<int>();
+    if (mHyperlinkActive && mCurrentHyperlinkLinkId) {
+        ids.insert(mCurrentHyperlinkLinkId);
+    }
+    if (mHyperlinkEnclosingMxpLinkId) {
+        ids.insert(mHyperlinkEnclosingMxpLinkId);
+    }
+    // The MXP client issues its ids from the main console's store, not this buffer's
+    TConsoleModel* pMainModel = mpHost.isNull() ? nullptr : mpHost->mainConsoleModelOrNull();
+    if (pMainModel && this == &pMainModel->buffer && mpHost->mMxpClient.isInLinkMode() && mpHost->mMxpClient.linkId()) {
+        ids.insert(mpHost->mMxpClient.linkId());
+    }
+    ids |= linkIdsOnTheLinesStillToCome();
+    return ids;
+}
+
+// The line the game is still sending, and the one held for a server wrap
+QSet<int> TBuffer::linkIdsOnTheLinesStillToCome() const
+{
+    QSet<int> ids;
+    for (const TLineFormat* pPending : {&mMudBuffer, &mServerWrapPendingBuffer}) {
+        int previousId = 0;
+        for (const TChar& c : *pPending) {
+            const int id = c.linkIndex();
+            if (id && id != previousId) {
+                ids.insert(id);
+                previousId = id;
+            }
+        }
+    }
+    return ids;
+}
+
 void TBuffer::clearLastLine()
 {
     if (!buffer.empty()) {
@@ -7627,9 +7973,11 @@ void TBuffer::shrinkBuffer()
     bool sweepLinks = mLinesUntilLinkSweep <= 0;
     const bool noteLinks = !sweepLinks && !mLinkStore.pristine();
     const qint64 firstTrimmedLine = mLinesRemovedTotal;
+    // Not told: link() of an id still in the store reads the whole buffer, and an app reading it for every link of
+    // every trim would do that thousands of times a trim. The sweep tells of each id once it is out of the store.
     if (noteLinks) {
         for (int i = 0; i < mBatchDeleteSize; ++i) {
-            noteRemovedLinks(buffer[i], firstTrimmedLine + i);
+            noteRemovedLinks(buffer[i], firstTrimmedLine + i, 0, -1, false);
         }
     }
 
@@ -7656,6 +8004,8 @@ void TBuffer::shrinkBuffer()
     // We need to adjust the search result line as some lines have now gone
     // away:
     if (mpModel) {
+        // Once they have gone, as what is held is read back from the lines left
+        mpModel->heldForLineShownLinesRemoved(0, mBatchDeleteSize - 1);
         mpModel->mCurrentSearchResult = qMax(0, mpModel->mCurrentSearchResult - mBatchDeleteSize);
         // As mCursorY above, which a real view's upper pane takes its line from as it repaints
         if (mpModel->mScrolledBackTo) {
@@ -7707,7 +8057,7 @@ void TBuffer::shrinkBuffer()
         // A concealed link's characters carry no index, so only its tracking says it was trimmed
         if (noteLinks) {
             for (const int id : droppedLinkIds) {
-                noteRemovedLinkId(id, firstTrimmedLine + mBatchDeleteSize - 1);
+                noteRemovedLinkId(id, firstTrimmedLine + mBatchDeleteSize - 1, false);
             }
         }
     }
@@ -7718,8 +8068,7 @@ void TBuffer::shrinkBuffer()
 
     if (sweepLinks) {
         mLinesUntilLinkSweep = mLinesLimit / 4;
-        // A concealed link's characters carry no index, so it has to be named to survive the sweep
-        clearLinkState(mpModel ? mpModel->mHyperlinkVisibilityManager.trackedLinkIds() : QSet<int>());
+        clearLinkState(liveLinkIdsOutsideTheLines());
     }
     mLinesUntilLinkSweep -= mBatchDeleteSize;
 
@@ -7771,6 +8120,9 @@ bool TBuffer::deleteLines(int from, int to)
         wrapGapBuffer.remove(from, delta);
 
         buffer.erase(buffer.begin() + from, buffer.begin() + to + 1);
+        if (mpModel) {
+            mpModel->heldForLineShownLinesRemoved(from, to);
+        }
         if (mLastFoundLine >= from) {
             mLastFoundLine = (mLastFoundLine > to) ? mLastFoundLine - delta : from - 1;
             if (mFirstFoundLine > to) {
@@ -7876,6 +8228,16 @@ bool TBuffer::applyLink(const QPoint& P_begin, const QPoint& P_end, const QStrin
     return false;
 }
 
+// The columns [from, to) of line y that styling from (x1, y1) to (x2, y2) reaches: on to the end of
+// every line but the last, which stops at x2
+static std::pair<int, int> styledColumns(const TLineFormat& line, const int y, const int x1, const int y1, const int x2, const int y2)
+{
+    const int size = static_cast<int>(line.size());
+    const int from = (y == y1) ? x1 : 0;
+    const int to = (y >= y2) ? std::min(x2, size) : size;
+    return {from, std::max(from, to)};
+}
+
 // Replaces (bool)TBuffer::applyXxxx(QPoint& P_begin, QPoint& P_end, bool state)
 // where Xxxxx is Bold, Italics, Strikeout, Underline
 // Can set multiple attributes to given state
@@ -7906,18 +8268,15 @@ bool TBuffer::applyAttribute(const QPoint& P_begin, const QPoint& P_end, const T
         // No materialisePreTriggerPassLine(): color matching reads only foreground()/background(), and
         // snapshotting would copy every line for a script that styles all of them.
         for (int y = y1; y <= y2; ++y) {
-            int x = 0;
-            if (y == y1) {
-                x = x1;
-            }
-            while (x < static_cast<int>(buffer.at(y).size())) {
-                if (y >= y2) {
-                    if (x >= x2) {
-                        return true;
-                    }
+            TLineFormat& line = buffer.at(y);
+            const auto [from, to] = styledColumns(line, y, x1, y1, x2, y2);
+            if (TChar* pShared = (from == 0 && to == static_cast<int>(line.size())) ? line.sharedFormat() : nullptr) {
+                pShared->setAttributes(attributes, state);
+            } else if (from < to) {
+                std::vector<TChar>& chars = line.expand();
+                for (int x = from; x < to; ++x) {
+                    chars[x].setAttributes(attributes, state);
                 }
-                buffer.at(y).expand().at(x).setAttributes(attributes, state);
-                ++x;
             }
         }
         return true;
@@ -7948,18 +8307,15 @@ bool TBuffer::applyFgColor(const QPoint& P_begin, const QPoint& P_end, const QCo
 
         for (int y = y1; y <= y2; ++y) {
             materialisePreTriggerPassLine(y);
-            int x = 0;
-            if (y == y1) {
-                // Override position start column if on first line to given start column
-                x = x1;
-            }
-            while (x < static_cast<int>(buffer.at(y).size())) {
-                if (y >= y2 && x >= x2) {
-                    // Escape if on or past last line and past last character on the last line
-                    return true;
+            TLineFormat& line = buffer.at(y);
+            const auto [from, to] = styledColumns(line, y, x1, y1, x2, y2);
+            if (TChar* pShared = (from == 0 && to == static_cast<int>(line.size())) ? line.sharedFormat() : nullptr) {
+                pShared->setForeground(newColor);
+            } else if (from < to) {
+                std::vector<TChar>& chars = line.expand();
+                for (int x = from; x < to; ++x) {
+                    chars[x].setForeground(newColor);
                 }
-
-                buffer.at(y).expand().at(x++).setForeground(newColor);
             }
         }
         return true;
@@ -7990,18 +8346,15 @@ bool TBuffer::applyBgColor(const QPoint& P_begin, const QPoint& P_end, const QCo
 
         for (int y = y1; y <= y2; ++y) {
             materialisePreTriggerPassLine(y);
-            int x = 0;
-            if (y == y1) {
-                // Override position start column if on first line to given start column
-                x = x1;
-            }
-            while (x < static_cast<int>(buffer.at(y).size())) {
-                if (y >= y2 && x >= x2) {
-                    // Escape if on or past last line and on or past last character on last line
-                    return true;
+            TLineFormat& line = buffer.at(y);
+            const auto [from, to] = styledColumns(line, y, x1, y1, x2, y2);
+            if (TChar* pShared = (from == 0 && to == static_cast<int>(line.size())) ? line.sharedFormat() : nullptr) {
+                pShared->setBackground(newColor);
+            } else if (from < to) {
+                std::vector<TChar>& chars = line.expand();
+                for (int x = from; x < to; ++x) {
+                    chars[x].setBackground(newColor);
                 }
-
-                buffer.at(y).expand().at(x++).setBackground(newColor);
             }
         }
         return true;
@@ -9361,16 +9714,32 @@ void TBuffer::flushPendingLead()
     appendReplacementCharacter(mPendingLeadFormat);
 }
 
+void TBuffer::appendMxpText(const QString& text)
+{
+    if (text.isEmpty()) {
+        return;
+    }
+    TChar::AttributeFlags attributeFlags = computeCurrentAttributeFlags();
+    attributeFlags &= ~(TChar::FastBlink | TChar::Concealed | TChar::AltFontMask);
+    appendLinkedText(text, TChar((!mIsDefaultColor && mBold) ? mForeGroundColorLight : mForeGroundColor, mBackGroundColor, attributeFlags));
+}
+
 void TBuffer::appendReplacementCharacter(TChar c)
 {
-    mMudLine.append(QChar::ReplacementCharacter);
+    appendLinkedText(QString(QChar::ReplacementCharacter), c);
+}
+
+// Text added whole rather than decoded a character at a time, as part of any link open around it
+void TBuffer::appendLinkedText(const QString& text, TChar c)
+{
     styleForCurrentLink(c);
-    mMudBuffer.append(1, c);
+    if (mHyperlinkActive && mCurrentHyperlinkText.isEmpty()) {
+        mCurrentHyperlinkStartColumn = static_cast<int>(mMudBuffer.size());
+    }
+    mMudLine.append(text);
+    mMudBuffer.append(static_cast<TLineFormat::size_type>(text.size()), c);
     if (mHyperlinkActive) {
-        if (mCurrentHyperlinkText.isEmpty()) {
-            mCurrentHyperlinkStartColumn = static_cast<int>(mMudBuffer.size()) - 1;
-        }
-        mCurrentHyperlinkText += QChar::ReplacementCharacter;
+        mCurrentHyperlinkText += text;
     }
 }
 
@@ -9847,7 +10216,9 @@ void TBuffer::setLinkState(int linkIndex, Mudlet::HyperlinkStyling::LinkState st
         return; // Invalid link index
     }
 
-    mLinkStates[linkIndex] = state;
+    if (std::exchange(mLinkStates[linkIndex], state) != state) {
+        noteLinkChanged(linkIndex);
+    }
 
 #if defined(DEBUG_OSC_PROCESSING)
     QString stateName;
@@ -9969,7 +10340,7 @@ void TBuffer::setHoveredLink(int linkIndex)
             // Priority: disabled > selected > visited > default
             // Disabled links should stay disabled
             Mudlet::HyperlinkStyling linkStyling = getEffectiveHyperlinkStyling(previousHoveredLink);
-            if (linkStyling.selection.hasSelectionSettings && linkStyling.selection.disabled) {
+            if (linkStyling.selection.disabled) {
                 setLinkState(previousHoveredLink, Mudlet::HyperlinkStyling::StateDisabled);
             } else if (isLinkSelected(previousHoveredLink)) {
                 setLinkState(previousHoveredLink, Mudlet::HyperlinkStyling::StateSelected);
@@ -9997,6 +10368,11 @@ void TBuffer::setHoveredLink(int linkIndex)
 
 void TBuffer::setActiveLink(int linkIndex)
 {
+    // Restyling a disabled link to show it pressed would clear the game's own formatting
+    if (linkIndex > 0 && getEffectiveHyperlinkStyling(linkIndex).selection.disabled) {
+        return;
+    }
+
     int previousActiveLink = mCurrentActiveLinkIndex;
     mCurrentActiveLinkIndex = linkIndex;
 
@@ -10004,7 +10380,7 @@ void TBuffer::setActiveLink(int linkIndex)
     if (previousActiveLink > 0 && previousActiveLink != linkIndex) {
         // Return to appropriate state based on priority: disabled > hover > selected > visited > default
         Mudlet::HyperlinkStyling linkStyling = getEffectiveHyperlinkStyling(previousActiveLink);
-        if (linkStyling.selection.hasSelectionSettings && linkStyling.selection.disabled) {
+        if (linkStyling.selection.disabled) {
             setLinkState(previousActiveLink, Mudlet::HyperlinkStyling::StateDisabled);
         } else if (previousActiveLink == mCurrentHoveredLinkIndex) {
             setLinkState(previousActiveLink, Mudlet::HyperlinkStyling::StateHover);
@@ -10035,7 +10411,7 @@ void TBuffer::setFocusedLink(int linkIndex)
     if (previousFocusedLink > 0 && previousFocusedLink != linkIndex) {
         // Preserve disabled state, otherwise return to base state
         Mudlet::HyperlinkStyling linkStyling = getEffectiveHyperlinkStyling(previousFocusedLink);
-        if (linkStyling.selection.hasSelectionSettings && linkStyling.selection.disabled) {
+        if (linkStyling.selection.disabled) {
             setLinkState(previousFocusedLink, Mudlet::HyperlinkStyling::StateDisabled);
         } else if (isLinkSelected(previousFocusedLink)) {
             setLinkState(previousFocusedLink, Mudlet::HyperlinkStyling::StateSelected);
@@ -10048,16 +10424,21 @@ void TBuffer::setFocusedLink(int linkIndex)
 
     // Set new link to focus state
     if (linkIndex > 0) {
-        // Determine if focus came from keyboard (would use StateFocusVisible)
-        // For now, we use StateFocus
-        setLinkState(linkIndex, Mudlet::HyperlinkStyling::StateFocus);
+        // Disabled links stay disabled, and a screen reader is told so from this state.
+        if (getLinkState(linkIndex) != Mudlet::HyperlinkStyling::StateDisabled) {
+            // Determine if focus came from keyboard (would use StateFocusVisible)
+            // For now, we use StateFocus
+            setLinkState(linkIndex, Mudlet::HyperlinkStyling::StateFocus);
+        }
     }
 }
 
 void TBuffer::markLinkAsVisited(int linkIndex)
 {
     if (linkIndex > 0) {
-        mVisitedLinks[linkIndex] = true;
+        if (!std::exchange(mVisitedLinks[linkIndex], true)) {
+            noteLinkChanged(linkIndex);
+        }
 
         // If the link is not in an interactive state (hover/active/focus),
         // update it to visited state immediately
@@ -10079,9 +10460,41 @@ bool TBuffer::isLinkVisited(int linkIndex) const
     return mVisitedLinks.value(linkIndex, false);
 }
 
+bool TBuffer::linkHeld(const int linkIndex) const
+{
+    if (linkIndex <= 0 || !mLinkStore.contains(linkIndex)) {
+        return false;
+    }
+    if (!mLinkIdsRemovedSinceSweep.contains(linkIndex)) {
+        return true;
+    }
+    // A concealed link's characters carry no index
+    if (mpModel && mpModel->mHyperlinkVisibilityManager.trackedLinkIds().contains(linkIndex)) {
+        return true;
+    }
+    for (const TLineFormat& line : buffer) {
+        for (const TChar& c : line) {
+            if (c.linkIndex() == linkIndex) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 void TBuffer::setLinkSelected(int linkIndex, bool selected)
 {
+    if (mLinkSelectionState.value(linkIndex, false) != selected) {
+        noteLinkChanged(linkIndex);
+    }
     mLinkSelectionState[linkIndex] = selected;
+}
+
+void TBuffer::noteLinkChanged(const int linkIndex)
+{
+    if (mpModel && mpModel->mNotifier.linkChangedConnected()) {
+        emit mpModel->mNotifier.linkChanged(linkIndex);
+    }
 }
 
 bool TBuffer::isLinkSelected(int linkIndex) const
@@ -10157,6 +10570,7 @@ void TBuffer::revealSpoilerLink(int linkIndex)
     updateLinkCharacters(linkIndex);
 
     mLinkOriginalText.remove(linkIndex);
+    noteLinkChanged(linkIndex);
 
     if (mpModel) {
         emit mpModel->mNotifier.spoilerRevealed();

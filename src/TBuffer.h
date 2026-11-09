@@ -481,6 +481,8 @@ public:
     const_iterator cend() const { return end(); }
     // Stored as one shared TChar; a line held per character may still look uniform
     bool uniform() const { return mUniformCount; }
+    // The one TChar every character shares, so writing it restyles them all; null unless uniform()
+    TChar* sharedFormat() { return mUniformCount ? &mUniform : nullptr; }
     // The per-character storage's heap block, null when none is held
     const TChar* heapData() const { return mChars.data(); }
     size_type capacity() const { return mChars.capacity(); }
@@ -489,6 +491,10 @@ public:
     // the next non-const call
     std::vector<TChar>& expand();
     std::vector<TChar> toVector() const;
+    // Selects [from, to); a line stored as one TChar stays that way when all of it is selected
+    void select(size_type from, size_type to);
+    // Stores a selected line as one TChar when deselecting it leaves every character alike
+    void deselect();
     // As std::vector::insert() would, so format is stored deselected
     void insert(size_type index, size_type count, const TChar& format);
     void append(size_type count, const TChar& format) { insert(size(), count, format); }
@@ -658,6 +664,10 @@ public:
     const TLineFormat& detachedTriggerPassLine() const { return mPreTriggerPassLine; }
     const QString& detachedTriggerPassLineText() const { return mDetachedTriggerPassLineText; }
     static constexpr int csmDetachedTriggerPassLine = -2;
+    // Whether a trigger pass, the current one or one a feedTriggers() paused, is running over the line,
+    // or over one a wrap split it off
+    bool triggerPassRunningOn(int lineNumber) const;
+    bool triggerPassUnderWay() const { return !mEnclosingTriggerPasses.isEmpty(); }
     int find(int line, const QString& what, int pos);
     QStringList split(int line, const QString& splitter);
     QStringList split(int line, const QRegularExpression& splitter);
@@ -783,9 +793,11 @@ private:
     QHash<int, qint64> mLinkIdIssuedAtLine;
     bool linkHoldsState(const int id) const;
     QSet<int> collectLiveLinkIdsResettingIssueLines();
+    QSet<int> liveLinkIdsOutsideTheLines();
+    QSet<int> linkIdsOnTheLinesStillToCome() const;
     void dropStateOfRemovedLinks();
-    void noteRemovedLinkId(int id, qint64 lastLine);
-    void noteRemovedLinks(const TLineFormat& line, qint64 lineNumber, int from = 0, int to = -1);
+    void noteRemovedLinkId(int id, qint64 lastLine, bool tell = true);
+    void noteRemovedLinks(const TLineFormat& line, qint64 lineNumber, int from = 0, int to = -1, bool tell = true);
     THyperlinkVisibilityManager* hyperlinkVisibilityManagerOrNull();
     TChar currentFormat() const;
     inline QList<WrapInfo> getWrapInfo(const QString& lineText, bool isNewline, bool startsIndented, const int maxWidth, const int indent, const int hangingIndent);
@@ -797,6 +809,7 @@ private:
     void materialisePreTriggerPassLine(int y);
     void noteTriggerPassLineEdit(int y, int x, int removed, int inserted);
     void triggerPassLinesRemoved(int from, int to);
+    void triggerPassSegmentTaken(int lineNumber);
     int remapLinkId(const TLinkStore& sourceLinkStore, int sourceLinkId, QHash<int, int>& remappedLinkIds, int line = -1);
     int calculateWrapPosition(int lineNumber, int begin, int end);
     void handleNewLine();
@@ -845,6 +858,8 @@ private:
     void clearSequenceLatches();
     void endLocalFeedSequences();
     void appendReplacementCharacter(TChar);
+    void appendMxpText(const QString&);
+    void appendLinkedText(const QString&, TChar);
     static QStringDecoder multibyteDecoderFor(Decoder, const QByteArray&);
     bool decodeMultibyteSequence(QByteArrayView, QStringView&);
     // Views into the string decodeSGR() was handed, so none may outlive that call.
@@ -857,6 +872,7 @@ private:
     void registerLinkVisibility(const int linkId, const int column, const int length, const Mudlet::HyperlinkStyling& styling);
     void carryActiveHyperlinkPastFlush(QString& line, const TLineFormat& format);
     void maskSpoilerText(const int linkId, QString& line, const TLineFormat& format, const int column, const int length);
+    void forgetSpoilerTextOnTheLines(const QSet<int>& linkIds);
     void resetColors();
     bool commitLine(char ch, size_t& localBufferPosition, bool isFromServer = false, bool forcedLineBreak = false);
     void commitLineData(QString line, TLineFormat chars, char ch);
@@ -870,6 +886,8 @@ private:
     bool continuationRepeatsSegmentOpening() const;
     void joinPendingServerWrapOntoCurrent();
     void processMxpWatchdogCallback();
+    void watchMxpTag(bool tagWrittenOut);
+    void stopTagWatchdog();
     TChar::AttributeFlags computeCurrentAttributeFlags() const;
 
     // Helper function for parsing URI query parameters in OSC 8 hyperlinks
@@ -979,6 +997,11 @@ private:
     // Parked between lines so the trigger-pass snapshot reuses its allocation:
     TLineFormat mSpareTriggerPassLine;
     int mPreTriggerPassLineNumber = -1;
+    // The last of the lines a wrap split the pass line into, or the pass line itself
+    int mTriggerPassLineLastSegment = -1;
+    // Where the rest of a split pass line starts once its first part is deleted, which the console still shows
+    int mTriggerPassLineTailFrom = -1;
+    static int triggerPassSpanFirst(int passLine, int tailFrom) { return passLine >= 0 ? passLine : tailFrom; }
     // The index the current trigger pass was handed, which mPreTriggerPassLineNumber moves on from
     int mTriggerPassLineAsCommitted = -1;
     QString mDetachedTriggerPassLineText;
@@ -996,6 +1019,8 @@ private:
         int lineNumber = -1;
         QString detachedText;
         std::vector<TriggerPassLineEdit> edits;
+        int lastSegment = -1;
+        int tailFrom = -1;
     };
     // The passes a trigger calling feedTriggers() has paused. A member, not saved in
     // commitLineData()'s frame, as their lines move with deleted, rewrapped and
@@ -1004,6 +1029,9 @@ private:
     // Meaningful only inside a trigger pass: false until something overwrites
     // the committed line, while the game's colors are still readable from it:
     bool mPreTriggerPassSnapshotTaken = true;
+    // A line fed from inside the pass filled the pass's line, which it had left empty, so lineShown
+    // sends the fed line and not the pass's as well
+    bool mTriggerPassLineTaken = false;
     enum class PassLineUniformity { Unknown, Uniform, Mixed };
     // Worked out on demand, so a profile with no color triggers never pays for it:
     PassLineUniformity mPreTriggerPassLineUniformity = PassLineUniformity::Unknown;
@@ -1095,6 +1123,9 @@ private:
     int mHeldSpoilerLinkId = 0;
     int mHeldSpoilerStartColumn = 0;
     int mHeldSpoilerContinuationLength = 0;
+    // A link begun in held text that clear() ended rather than the game: should the held text turn
+    // out to be a whole line, the link ends with it, as it would have had it still been open
+    int mHeldLinkEndedByClear = 0;
     // Links with visibility settings closed while text is held back for joining. Where their text
     // ends up is known only once that is resolved - joined, or committed as a line of its own - so
     // each is registered then: from startColumn in the text it began in, through continuationLength
@@ -1211,6 +1242,8 @@ public:
     bool isLinkSelected(int linkIndex) const;
     void revealSpoilerLink(int linkIndex);
     bool isSpoilerUnrevealed(int linkIndex) const { return mLinkOriginalText.contains(linkIndex); }
+    // Whether a line still carries the link, concealed or not: the store keeps a removed line's links until a sweep
+    bool linkHeld(int linkIndex) const;
     void clearGroupSelection(const QString& group, const QString& exceptValue);
     void applyPendingSelectionStyling();
     void updateLinkCharacters(int linkIndex, int fromLine = 0);
@@ -1230,6 +1263,7 @@ public:
     void restoreLinkIndices(int lineNumber, int startColumn, int count, int linkIndex); // Restore link indices in a range
 
 private:
+    void noteLinkChanged(int linkIndex);
 };
 
 #ifndef QT_NO_DEBUG_STREAM

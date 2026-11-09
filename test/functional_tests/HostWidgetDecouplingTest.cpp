@@ -1140,8 +1140,8 @@ nullViewItemAfter = tostring(removeCommandLineMenuEvent("main", "nullViewItem"))
         startProfile(mHostname, mLocalhost, mPort);
         auto host = mudlet::self()->getActiveHost();
         QVERIFY2(host, "No active host available for the test.");
-        auto* editor = HostDialogs::of(host).mpEditorDialog.data();
-        QVERIFY2(editor, "The profile came up without its editor dialog.");
+        auto* editor = HostDialogs::editor(host);
+        QVERIFY2(editor, "No editor was built for the profile.");
         mudlet::self()->slot_notes();
         auto* notepad = HostDialogs::of(host).mpNotePad.data();
         QVERIFY2(notepad, "The notepad was not opened.");
@@ -1161,6 +1161,9 @@ nullViewItemAfter = tostring(removeCommandLineMenuEvent("main", "nullViewItem"))
         QCOMPARE(preferences->styleSheet(), styleSheet);
         QCOMPARE(notepad->styleSheet(), styleSheet);
         QCOMPARE(note->styleSheet(), styleSheet);
+        auto* laterNote = notepad->tabWidget->widget(notepad->addTab());
+        QVERIFY2(laterNote && laterNote != note, "Adding a note did not make a tab of its own.");
+        QCOMPARE(laterNote->styleSheet(), styleSheet);
     }
 
     // The main window's own bars take the style sheet of the profile on show,
@@ -1177,13 +1180,14 @@ nullViewItemAfter = tostring(removeCommandLineMenuEvent("main", "nullViewItem"))
         QVERIFY2(toolBar && tabBar, "The main window has no toolbar or tab bar.");
 
         const QString styleSheet = qsl("QWidget { color: #123456; }");
-        QVERIFY2(menuBar->styleSheet() != styleSheet && toolBar->styleSheet() != styleSheet && tabBar->styleSheet() != styleSheet,
+        QVERIFY2(menuBar->styleSheet() != styleSheet && !toolBar->styleSheet().endsWith(styleSheet) && tabBar->styleSheet() != styleSheet,
                  "SETUP: a bar already carries the style sheet, so the assertions below cannot fail.");
 
         QVERIFY(host->setProfileStyleSheet(styleSheet));
 
         QCOMPARE(menuBar->styleSheet(), styleSheet);
-        QCOMPARE(toolBar->styleSheet(), styleSheet);
+        // The toolbar carries the design's own sheet with the profile's appended, so the profile's rules come last and win
+        QVERIFY2(toolBar->styleSheet().endsWith(styleSheet), qPrintable(qsl("The toolbar's sheet does not end with the profile's: %1").arg(toolBar->styleSheet().right(200))));
         QCOMPARE(tabBar->styleSheet(), styleSheet);
     }
 
@@ -1201,16 +1205,18 @@ nullViewItemAfter = tostring(removeCommandLineMenuEvent("main", "nullViewItem"))
         QToolBar* toolBar = mudlet::self()->mpMainToolBar;
         TTabBar* tabBar = mudlet::self()->mpTabBar;
         QVERIFY2(toolBar && tabBar, "The main window has no toolbar or tab bar.");
+        // Neither profile has a sheet yet, so the bar carries the design's rules alone; a profile's comes after them
+        const QString designSheet = toolBar->styleSheet();
 
         const QString firstStyleSheet = qsl("QWidget { color: #111111; }");
         QVERIFY(first->setProfileStyleSheet(firstStyleSheet));
-        QVERIFY2(menuBar->styleSheet() != firstStyleSheet && toolBar->styleSheet() != firstStyleSheet && tabBar->styleSheet() != firstStyleSheet,
+        QVERIFY2(menuBar->styleSheet() != firstStyleSheet && toolBar->styleSheet() == designSheet && tabBar->styleSheet() != firstStyleSheet,
                  "A profile that is not the active one restyled the main window.");
 
         const QString secondStyleSheet = qsl("QWidget { color: #222222; }");
         QVERIFY(second->setProfileStyleSheet(secondStyleSheet));
         QCOMPARE(menuBar->styleSheet(), secondStyleSheet);
-        QCOMPARE(toolBar->styleSheet(), secondStyleSheet);
+        QCOMPARE(toolBar->styleSheet(), designSheet + secondStyleSheet);
         QCOMPARE(tabBar->styleSheet(), secondStyleSheet);
 
         tabBar->setCurrentIndex(tabBar->tabIndex(first->getName()));
@@ -1218,7 +1224,7 @@ nullViewItemAfter = tostring(removeCommandLineMenuEvent("main", "nullViewItem"))
 
         QVERIFY(second->setProfileStyleSheet(qsl("QWidget { color: #333333; }")));
         QCOMPARE(menuBar->styleSheet(), firstStyleSheet);
-        QCOMPARE(toolBar->styleSheet(), firstStyleSheet);
+        QCOMPARE(toolBar->styleSheet(), designSheet + firstStyleSheet);
         QCOMPARE(tabBar->styleSheet(), firstStyleSheet);
     }
 
@@ -1257,8 +1263,8 @@ nullViewItemAfter = tostring(removeCommandLineMenuEvent("main", "nullViewItem"))
         startProfile(mHostname, mLocalhost, mPort);
         auto host = mudlet::self()->getActiveHost();
         QVERIFY2(host, "No active host available for the test.");
-        auto* editor = HostDialogs::of(host).mpEditorDialog.data();
-        QVERIFY2(editor, "The profile came up without its editor dialog.");
+        auto* editor = HostDialogs::editor(host);
+        QVERIFY2(editor, "No editor was built for the profile.");
         auto* sourceEditor = editor->findChild<edbee::TextEditorWidget*>(qsl("edbeeEditorWidget"));
         QVERIFY2(sourceEditor, "The editor has no source editor pane.");
         mudlet::self()->slot_notes();
@@ -1289,8 +1295,8 @@ nullViewItemAfter = tostring(removeCommandLineMenuEvent("main", "nullViewItem"))
         startProfile(mHostname, mLocalhost, mPort);
         auto host = mudlet::self()->getActiveHost();
         QVERIFY2(host, "No active host available for the test.");
-        auto* editor = HostDialogs::of(host).mpEditorDialog.data();
-        QVERIFY2(editor, "The profile came up without its editor dialog.");
+        auto* editor = HostDialogs::editor(host);
+        QVERIFY2(editor, "No editor was built for the profile.");
 
         const enums::EditorSearchOptions options = enums::EditorSearchOptionCaseSensitive | enums::EditorSearchOptionWholeWord;
         QVERIFY2(editor->mSearchOptions != options, "SETUP: the editor already has these search options, so the assertions below cannot fail.");
@@ -1311,8 +1317,8 @@ nullViewItemAfter = tostring(removeCommandLineMenuEvent("main", "nullViewItem"))
         startProfile(mHostname, mLocalhost, mPort);
         auto host = mudlet::self()->getActiveHost();
         QVERIFY2(host, "No active host available for the test.");
-        auto* editor = HostDialogs::of(host).mpEditorDialog.data();
-        QVERIFY2(editor, "The profile came up without its editor dialog.");
+        auto* editor = HostDialogs::editor(host);
+        QVERIFY2(editor, "No editor was built for the profile.");
         auto* sourceEditor = editor->findChild<edbee::TextEditorWidget*>(qsl("edbeeEditorWidget"));
         QVERIFY2(sourceEditor, "The editor has no source editor pane.");
 
@@ -1337,8 +1343,8 @@ nullViewItemAfter = tostring(removeCommandLineMenuEvent("main", "nullViewItem"))
         startProfile(mHostname, mLocalhost, mPort);
         auto host = mudlet::self()->getActiveHost();
         QVERIFY2(host, "No active host available for the test.");
-        auto* editor = HostDialogs::of(host).mpEditorDialog.data();
-        QVERIFY2(editor, "The profile came up without its editor dialog.");
+        auto* editor = HostDialogs::editor(host);
+        QVERIFY2(editor, "No editor was built for the profile.");
         // One nobody has opened puts the rebuild off until it is
         editor->show();
         QVERIFY2(editor->mpTriggerBaseItem, "The editor has no trigger tree root.");
@@ -1371,8 +1377,8 @@ nullViewItemAfter = tostring(removeCommandLineMenuEvent("main", "nullViewItem"))
         startProfile(mHostname, mLocalhost, mPort);
         auto host = mudlet::self()->getActiveHost();
         QVERIFY2(host, "No active host available for the test.");
-        const QPointer<dlgTriggerEditor> editor(HostDialogs::of(host).mpEditorDialog.data());
-        QVERIFY2(editor, "The profile came up without its editor dialog.");
+        const QPointer<dlgTriggerEditor> editor(HostDialogs::editor(host));
+        QVERIFY2(editor, "No editor was built for the profile.");
         mudlet::self()->slot_notes();
         const QPointer<dlgNotepad> notepad(HostDialogs::of(host).mpNotePad.data());
         QVERIFY2(notepad, "The notepad was not opened.");

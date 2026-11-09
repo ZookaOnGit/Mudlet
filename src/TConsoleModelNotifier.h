@@ -32,8 +32,10 @@ class TConsoleModelNotifier : public QObject
 public:
     using QObject::QObject;
 
-    // isSignalConnected() is protected. The GUI never connects textPrinted, so this spares it the work.
+    // isSignalConnected() is protected. The GUI never connects textPrinted or lineShown, so this spares it the work.
     bool textPrintedConnected() const;
+    bool lineShownConnected() const;
+    bool linkChangedConnected() const;
 
 signals:
     // The count is of every line in the buffer, not just the new ones.
@@ -41,6 +43,10 @@ signals:
     // Before triggers run on the line; read it now, as a buffer shrink moves it. The commit is half
     // done, so a handler may neither add a line nor run the event loop.
     void lineCommitted(int lineIndex);
+    // Once triggers have run on the line lineCommitted sent, before it is wrapped: where it now stands, or -1
+    // if they deleted it, and the last of the lines a script's wrap split it into. One follows every
+    // lineCommitted, so those of lines fed from inside the pass come first.
+    void lineShown(int lineIndex, int lastSegment);
     // Client output (echo(), print(), the command echo, Mudlet's messages), in pieces that need not end
     // a line; also an echo() or command echo written into a trigger's or a prompt's line, which --mirror
     // does not copy.
@@ -56,9 +62,20 @@ signals:
     void newLinesWritten();
     // mShowTimeStamps was flipped.
     void timeStampsToggled();
+    // mWrapAt, mIndentCount or mHangingIndentCount changed.
+    void wrapChanged();
+    // Host::refreshMainConsoleColors() ran, which may have changed mFgColor or mBgColor.
+    void colorsChanged();
+    // The null view timed a pass of incoming text, in mIncomingTextSeconds.
+    void incomingTextProcessed();
     // The buffer was emptied, so view state indexing its old lines is stale.
     void bufferCleared();
     void spoilerRevealed();
+    // The null view's alertNewData(): game text came in that the profile asks to be alerted to.
+    void newDataAlerted();
+    // What a link offers changed: its state, its selection, its spoiler, or it was expired, swept from the store or
+    // a line holding it was deleted. Not for a trim, which leaves the link to the sweep.
+    void linkChanged(int linkIndex);
 };
 
 #endif // MUDLET_TCONSOLEMODELNOTIFIER_H

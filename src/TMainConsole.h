@@ -53,6 +53,7 @@ class QDialog;
 class QDockWidget;
 class QProgressDialog;
 class QTimer;
+class QWindow;
 
 class TMainConsole : public TConsole, public TConsoleFrontend
 {
@@ -188,6 +189,8 @@ public:
     TConsole* deregisterSubConsole(const QString& name);
     void registerDockWidget(const QString& name, TDockWidget* pDockWidget);
     TDockWidget* deregisterDockWidget(const QString& name);
+    // For ~TConsole, which deregisters itself from the registry. By value: a replacement may hold the name.
+    void forgetSubConsole(TConsole* pConsole);
     bool openUserWindow(const QString& name, bool loadLayout, bool autoDock, const QString& area) override;
     TConsole* subConsoleWidget(const QString& name) const { return mSubConsoleMap.value(name); }
     QString subConsoleName(TConsole* pConsole) const { return mSubConsoleMap.key(pConsole); }
@@ -362,10 +365,8 @@ public:
 
 
 public slots:
-    // Used by mudlet class as told by "Profile Preferences"
-    // =>"Copy Map" in another profile to inform a list of
-    // profiles - asynchronously - to load in an updated map
-    void slot_reloadMap(QList<QString>);
+    // From "Copy Map" in another profile; mapFileName is a bare name in this profile's map folder
+    void slot_reloadMap(QList<QString>, const QString& mapFileName);
 
 
 private slots:
@@ -387,6 +388,9 @@ signals:
 private:
     QString assembleTriggerMatchPoolReport() const;
     bool eventFilter(QObject* watched, QEvent* event) override;
+#if defined(Q_OS_WINDOWS) || defined(Q_OS_LINUX)
+    void slot_focusWindowChanged(QWindow* pFocusWindow);
+#endif
     void openPasswordEntry();
     void closePasswordEntry();
     TPasswordEntry* passwordEntry() const;

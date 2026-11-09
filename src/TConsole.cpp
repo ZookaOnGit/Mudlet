@@ -44,11 +44,11 @@
 #include "TTextEdit.h"
 #include "dlgMapper.h"
 #include "mudlet.h"
+#include "uiDesign.h"
 
 #include <QAccessibleInterface>
 #include <QAccessibleWidget>
 #include <QApplication>
-#include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QFrame>
@@ -78,6 +78,8 @@ using namespace std::chrono_literals;
 namespace {
 // Between the text panes and the vertical scroll bar; predictions of pane width must subtract it.
 constexpr int scrollBarSpacing = 1;
+
+constexpr int footSeamHeight = 1;
 
 // Windows 11 colours the handle for the app's colour scheme, not its surface: 45% black, invisible on a
 // black console. A style, not a style sheet: a widget's own sheet outranks every rule, so it would drop
@@ -212,11 +214,11 @@ void setCommandLinePalette(TCommandLine* pCommandLine, const QPalette& palette)
 
 // A high-performance text widget with split screen ability for scrolling back
 // Contains two TTextEdits, and is backed by a TBuffer
-TConsole::TConsole(Host* pH, const QString& name, const ConsoleType type, QWidget* parent)
+TConsole::TConsole(Host* pH, const QString& name, const ConsoleType type, QWidget* parent, std::unique_ptr<TConsoleModel> handedModel)
 : QWidget(parent)
 , mpHost(pH)
 , mDisplayFontDetails(pH->fontsAntiAlias())
-, mpOwnModel(ownConsoleModel(pH, name, type))
+, mpOwnModel(handedModel ? std::move(handedModel) : ownConsoleModel(pH, name, type))
 , mpModel(mpOwnModel ? mpOwnModel.get() : &pH->mainConsoleModel())
 , buffer(mpModel->buffer)
 , emergencyStop(new QToolButton)
@@ -517,13 +519,25 @@ TConsole::TConsole(Host* pH, const QString& name, const ConsoleType type, QWidge
     layerCommandLine->setSizePolicy(sizePolicy);
     layerCommandLine->setFocusPolicy(Qt::NoFocus);
 
-    layerCommandLine->setMaximumHeight(31);
-    layerCommandLine->setMinimumHeight(31);
+    layerCommandLine->setMaximumHeight(commandLineLayerHeight(31));
+    layerCommandLine->setMinimumHeight(commandLineLayerHeight(31));
     layerCommandLine->setMinimumWidth(300);
 
-    layoutLayer2 = new QHBoxLayout(layerCommandLine);
+    mpFootSeam = new QWidget;
+    mpFootSeam->setObjectName(qsl("consoleFootSeam"));
+    mpFootSeam->setFixedHeight(footSeamHeight);
+    mpFootSeam->setAutoFillBackground(true);
+
+    auto commandLineLayerLayout = new QVBoxLayout(layerCommandLine);
+    commandLineLayerLayout->setContentsMargins(0, 0, 0, 0);
+    commandLineLayerLayout->setSpacing(0);
+    if (mType != MainConsole) {
+        commandLineLayerLayout->addWidget(mpFootSeam);
+    }
+    layoutLayer2 = new QHBoxLayout;
     layoutLayer2->setContentsMargins(0, 0, 0, 0);
     layoutLayer2->setSpacing(0);
+    commandLineLayerLayout->addLayout(layoutLayer2);
 
     mpButtonMainLayer = new QWidget;
     mpButtonMainLayer->setObjectName(qsl("mpButtonMainLayer"));
@@ -771,7 +785,14 @@ TConsole::TConsole(Host* pH, const QString& name, const ConsoleType type, QWidge
         commandSplitter->setCollapsible(0, false); // command line cannot collapse
         commandSplitter->setCollapsible(1, false); // search layer cannot collapse
 
-        centralLayout->addWidget(commandSplitter);
+        mpFoot = new QWidget(this);
+        mpFoot->setObjectName(qsl("consoleFoot"));
+        auto footLayout = new QVBoxLayout(mpFoot);
+        footLayout->setContentsMargins(0, 0, 0, 0);
+        footLayout->setSpacing(0);
+        footLayout->addWidget(mpFootSeam);
+        footLayout->addWidget(commandSplitter);
+        centralLayout->addWidget(mpFoot);
         restoreCommandSearchSettings();
     } else {
         centralLayout->addWidget(layerCommandLine);
@@ -878,6 +899,11 @@ TConsole::~TConsole()
     // widget it was created into, e.g. a scroll box.
     if (mType & (SubConsole | UserWindow | Buffer)) {
         mpHost->windowRegistry().deregisterSubConsole(mConsoleName, mpModel);
+        // Now, not in ~QObject: ~QWidget destroys our command line first, and its destroyed()
+        // handler looks consoles up by name, which would reach this one half destroyed.
+        if (auto pMainConsole = mpHost->mainConsoleView()) {
+            pMainConsole->forgetSubConsole(this);
+        }
     }
 
 #if defined(DEBUG_CODEPOINT_PROBLEMS)
@@ -1048,7 +1074,7 @@ void TConsole::resizeEvent(QResizeEvent* event)
 void TConsole::layoutMainDisplay()
 {
     const int x = width() - mpLeftToolBar->width() - mpRightToolBar->width();
-    const int y = height() - mpTopToolBar->height() - mpCommandLine->height();
+    const int y = height() - mpTopToolBar->height() - mpCommandLine->height() - footSeamHeightShown();
     // Move before resizing: resizing first could leave the display overrunning
     // its parent frame, clipping it and making TTextEdit::updateScreenView()
     // undercount the visible rows:
@@ -1084,7 +1110,7 @@ void TConsole::refresh()
 
     // Move before resizing, see comment in layoutMainDisplay():
     mpMainDisplay->move(mBorders.left(), mBorders.top());
-    mpMainDisplay->resize(x - mBorders.left() - mBorders.right(), y - mBorders.top() - mBorders.bottom() - mpCommandLine->height());
+    mpMainDisplay->resize(x - mBorders.left() - mBorders.right(), y - mBorders.top() - mBorders.bottom() - mpCommandLine->height() - footSeamHeightShown());
 
     if (!mpCommandLine.isNull()) {
         mpCommandLine->adjustHeight();
@@ -1226,36 +1252,16 @@ void TConsole::slot_toggleReplayRecording()
         return;
     }
     cTelnet& telnet = mpHost->mTelnet;
-    if (!telnet.recordingReplay()) {
-        const QString directoryLogFile = MudletApp::getMudletPath(enums::profileReplayAndLogFilesPath, mProfileName);
-        const QString mLogFileName = qsl("%1/%2.dat").arg(directoryLogFile, QDateTime::currentDateTime().toString(qsl("yyyy-MM-dd#HH-mm-ss")));
-        const QDir dirLogFile;
-        if (!dirLogFile.exists(directoryLogFile)) {
-            dirLogFile.mkpath(directoryLogFile);
-        }
-        if (!telnet.startReplayRecording(mLogFileName)) {
-            // clicked() fires after the button has toggled itself on:
-            replayButton->setChecked(false);
-            qWarning() << "TConsole: failed to open replay file for writing:" << telnet.replayRecordingErrorString();
-            //: Informational message displayed when replay recording file could not be opened. %1 is the reason
-            printSystemMessage(tr("Failed to open replay recording file for writing: %1").arg(telnet.replayRecordingErrorString()) % QChar::LineFeed);
-            return;
-        }
-        printSystemMessage(tr("Replay recording has started. File: %1").arg(telnet.replayRecordingFileName()) % QChar::LineFeed);
+    telnet.toggleReplayRecording();
+    if (telnet.recordingReplay()) {
         //: Button tooltip for the replay recording toggle button
         replayButton->setToolTip(utils::richText(tr("Stop recording of replay")));
-    } else {
-        if (!telnet.stopReplayRecording()) {
-            qWarning() << "TConsole::slot_toggleReplayRecording: error saving replay: " << telnet.replayRecordingErrorString();
-            //: Informational message displayed when replay recording is stopped but could not be saved. %1 is the reason
-            printSystemMessage(tr("Replay recording has been stopped, but couldn't be saved: %1").arg(telnet.replayRecordingErrorString()) % QChar::LineFeed);
-        } else {
-            //: Informational message displayed when replay recording is stopped
-            printSystemMessage(tr("Replay recording has been stopped. File: %1").arg(telnet.replayRecordingFileName()) % QChar::LineFeed);
-        }
-        //: Button tooltip for the replay recording toggle button
-        replayButton->setToolTip(utils::richText(tr("Start recording of replay")));
+        return;
     }
+    // clicked() fires after the button has toggled itself on, so one that could not start is turned off again
+    replayButton->setChecked(false);
+    //: Button tooltip for the replay recording toggle button
+    replayButton->setToolTip(utils::richText(tr("Start recording of replay")));
 }
 
 QString getColorCode(QColor color)
@@ -1333,6 +1339,15 @@ void TConsole::changeColors()
         updateMainFrameTransparency();
     } else {
         Q_ASSERT_X(false, "TConsole::changeColors()", "invalid TConsole type detected");
+    }
+    applyFootSeamColour();
+    // The settings dialog and an import restyle only the main console, yet every foot mixes these colours
+    if (auto pMainConsole = qobject_cast<TMainConsole*>(this); pMainConsole && !mpHost.isNull()) {
+        for (const QString& name : mpHost->windowRegistry().subConsoleNames()) {
+            if (TConsole* pSubConsole = pMainConsole->subConsoleWidget(name)) {
+                pSubConsole->applyFootSeamColour();
+            }
+        }
     }
 
     if (mType != MainConsole) {
@@ -1454,6 +1469,11 @@ void TConsole::scrollDown(int lines)
 void TConsole::scrollUp(int lines)
 {
     if ((mType & (UserWindow | SubConsole)) && !mScrollingEnabled) {
+        return;
+    }
+
+    // With every line already on screen there is nothing to scroll back to, and a split would only show them twice
+    if (mLowerPane->isHidden() && mUpperPane->imageTopLine() == 0) {
         return;
     }
 
@@ -1711,6 +1731,26 @@ bool TConsole::updateWindowBackgroundCoverPixmap()
     return true;
 }
 
+int TConsole::commandLineLayerHeight(const int commandLineHeight) const
+{
+    return mType == MainConsole ? commandLineHeight : commandLineHeight + footSeamHeight;
+}
+
+int TConsole::footSeamHeightShown() const
+{
+    return mpFootSeam && mpFootSeam->isVisibleTo(this) ? footSeamHeight : 0;
+}
+
+void TConsole::applyFootSeamColour()
+{
+    if (!mpFootSeam || mpHost.isNull()) {
+        return;
+    }
+    QPalette seamPalette;
+    seamPalette.setColor(QPalette::Window, uiDesign::blend(mpHost->mCommandLineBgColor, mpHost->mCommandLineFgColor, uiDesign::scmConsoleFootSeamStrength));
+    mpFootSeam->setPalette(seamPalette);
+}
+
 void TConsole::setCmdVisible(bool isVisible)
 {
     const QSizePolicy sizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
@@ -1739,6 +1779,9 @@ void TConsole::setCmdVisible(bool isVisible)
         }
     } else {
         mpButtonMainLayer->setVisible(false);
+    }
+    if (mpFoot) {
+        mpFoot->setVisible(isVisible);
     }
     layerCommandLine->setVisible(isVisible);
     mpCommandLine->setVisible(isVisible);
@@ -2270,7 +2313,7 @@ QSize TConsole::getMainWindowSize() const
     const QSize consoleSize = predicted ? parentWidget()->size() : size();
     const int toolbarWidth = mpLeftToolBar->width() + mpRightToolBar->width();
     const int toolbarHeight = mpTopToolBar->height();
-    const int commandLineHeight = mpCommandLine->height();
+    const int commandLineHeight = mpCommandLine->height() + footSeamHeightShown();
     const QSize mainWindowSize(consoleSize.width() - toolbarWidth, consoleSize.height() - (commandLineHeight + toolbarHeight));
 
     // A profile being switched to gets its geometry over several events, so in
