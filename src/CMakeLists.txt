@@ -36,7 +36,43 @@ if(USE_FONTS)
   list(APPEND mudlet_RCCS mudlet_fonts_common.qrc)
   if(CMAKE_SYSTEM_NAME STREQUAL Linux OR CMAKE_SYSTEM_NAME STREQUAL FreeBSD)
     list(APPEND mudlet_RCCS mudlet_fonts_posix.qrc)
+    set(INCLUDE_EMOJI_FONT ON)
   endif()
+endif()
+
+# Mudlet's Lua files and their translations, laid out as "make install" lays them out. A test loads it
+# too, so it is written whether or not USE_BUILTIN_MUDLET_LUA builds it into mudlet_core.
+set(BUILTIN_LUA_FOLDER "${CMAKE_CURRENT_SOURCE_DIR}/mudlet-lua/lua")
+set(BUILTIN_LUA_TRANSLATIONS_FOLDER "${mudlet_SOURCE_DIR}/translations/lua")
+file(GLOB_RECURSE BUILTIN_LUA_FILES CONFIGURE_DEPENDS
+     RELATIVE "${BUILTIN_LUA_FOLDER}" "${BUILTIN_LUA_FOLDER}/*.lua")
+file(GLOB_RECURSE BUILTIN_LUA_TRANSLATIONS CONFIGURE_DEPENDS
+     RELATIVE "${BUILTIN_LUA_TRANSLATIONS_FOLDER}" "${BUILTIN_LUA_TRANSLATIONS_FOLDER}/*.json")
+if(NOT BUILTIN_LUA_FILES)
+  message(FATAL_ERROR "No Lua files found in ${BUILTIN_LUA_FOLDER}")
+endif()
+# A checkout's path may hold what XML reserves
+foreach(BUILTIN_LUA_PATH BUILTIN_LUA_FOLDER BUILTIN_LUA_TRANSLATIONS_FOLDER)
+  string(REPLACE "&" "&amp;" ${BUILTIN_LUA_PATH} "${${BUILTIN_LUA_PATH}}")
+  string(REPLACE "<" "&lt;" ${BUILTIN_LUA_PATH} "${${BUILTIN_LUA_PATH}}")
+  string(REPLACE ">" "&gt;" ${BUILTIN_LUA_PATH} "${${BUILTIN_LUA_PATH}}")
+endforeach()
+set(BUILTIN_LUA_QRC "<RCC>\n<qresource prefix=\"/builtin/mudlet-lua/lua\">\n")
+foreach(BUILTIN_LUA_FILE ${BUILTIN_LUA_FILES})
+  string(APPEND BUILTIN_LUA_QRC "<file alias=\"${BUILTIN_LUA_FILE}\">${BUILTIN_LUA_FOLDER}/${BUILTIN_LUA_FILE}</file>\n")
+endforeach()
+foreach(BUILTIN_LUA_FILE ${BUILTIN_LUA_TRANSLATIONS})
+  string(APPEND BUILTIN_LUA_QRC
+         "<file alias=\"translations/${BUILTIN_LUA_FILE}\">${BUILTIN_LUA_TRANSLATIONS_FOLDER}/${BUILTIN_LUA_FILE}</file>\n")
+endforeach()
+string(APPEND BUILTIN_LUA_QRC "</qresource>\n</RCC>\n")
+# Only when it changes, as every build would otherwise compile it again
+set(BUILTIN_LUA_QRC_WRITTEN "")
+if(EXISTS "${CMAKE_CURRENT_BINARY_DIR}/mudlet_lua.qrc")
+  file(READ "${CMAKE_CURRENT_BINARY_DIR}/mudlet_lua.qrc" BUILTIN_LUA_QRC_WRITTEN)
+endif()
+if(NOT BUILTIN_LUA_QRC_WRITTEN STREQUAL BUILTIN_LUA_QRC)
+  file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/mudlet_lua.qrc" "${BUILTIN_LUA_QRC}")
 endif()
 
 # Add every .cpp source file that does not need Qt Widgets here, for mudlet_core, kept
@@ -97,6 +133,7 @@ set(mudlet_SRCS
     TAreaSpanIndex.cpp
     TAreaZLevelIndex.cpp
     TAudioMixer.cpp
+    TBackgroundTask.cpp
     TBuffer.cpp
     TCommandHistory.cpp
     TCommandLineCompletion.cpp
@@ -431,6 +468,7 @@ set(mudlet_HDRS
     TAreaZLevelIndex.h
     TAstar.h
     TAudioMixer.h
+    TBackgroundTask.h
     TBuffer.h
     TCommandHistory.h
     TCommandLineCompletion.h
@@ -521,6 +559,7 @@ set(mudlet_HDRS
     TTimer.h
     TTrigger.h
     TVar.h
+    TWindowNotifier.h
     TWindowRegistry.h
     UntrustedText.h
     utils.h
@@ -917,6 +956,10 @@ endif()
 # target_compile_definitions(${LIB_MUDLET_TARGET} PUBLIC DEBUG_PLAYER_ICON_CONTROLS)
 
 target_sources(${LIB_MUDLET_TARGET} PUBLIC "${mudlet_BINARY_DIR}/translations/translated/qm.qrc")
+if(USE_BUILTIN_MUDLET_LUA)
+  target_sources(${LIB_MUDLET_TARGET} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/mudlet_lua.qrc")
+  set_property(SOURCE TLuaInterpreter.cpp APPEND PROPERTY COMPILE_DEFINITIONS INCLUDE_BUILTIN_MUDLET_LUA)
+endif()
 
 set_target_properties(${LIB_MUDLET_TARGET} PROPERTIES
   AUTOMOC ON AUTORCC ON POSITION_INDEPENDENT_CODE ON
@@ -938,6 +981,10 @@ endif()
 
 if(USE_FONTS)
   target_compile_definitions(${LIB_MUDLET_TARGET} PUBLIC INCLUDE_FONTS)
+  # Code tests this, not Q_OS_LINUX, which Qt defines for Android too
+  if(INCLUDE_EMOJI_FONT)
+    target_compile_definitions(${LIB_MUDLET_TARGET} PUBLIC INCLUDE_EMOJI_FONT)
+  endif()
 endif()
 
 if(UNIX)
@@ -1037,6 +1084,13 @@ target_include_directories(${LIB_MUDLET_TARGET} INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_BINARY_DIR}/${LIB_MUDLET_TARGET}_autogen/include
 )
+
+if(USE_BUNDLED_LUA_MODULES)
+  # From here, where the libraries the modules link against have been found
+  include(BundledLuaModules)
+  target_link_libraries(${LIB_MUDLET_TARGET} mudlet_lua_modules)
+  set_property(SOURCE TLuaInterpreter.cpp APPEND PROPERTY COMPILE_DEFINITIONS INCLUDE_BUNDLED_LUA_MODULES)
+endif()
 
 if (SYSINFO_LIBRARY)
   target_link_libraries(${LIB_MUDLET_TARGET} ${SYSINFO_LIBRARY} ${KVM_LIBRARY})
