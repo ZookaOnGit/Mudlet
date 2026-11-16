@@ -28,6 +28,7 @@
 #include "MudletApp.h"
 
 #include "SecureStringUtils.h"
+#include "TAppFrontend.h"
 #include "TGameDetails.h"
 #include "TSpellChecker.h"
 #include "ctelnet.h"
@@ -65,6 +66,9 @@
 #if defined(Q_OS_UNIX)
 #include <cerrno>
 #include <unistd.h>
+#endif
+#if defined(Q_OS_ANDROID)
+#include <QJniEnvironment>
 #endif
 
 namespace {
@@ -458,9 +462,26 @@ void MudletApp::setConfigPath(const QString& path, const bool portable)
     discardSettingsStore();
 }
 
-void MudletApp::chooseConfigRoot(const QString& path)
+bool MudletApp::chosenRootKeepsPasswords()
 {
-    setConfigPath(path, true);
+#if defined(Q_OS_ANDROID)
+    // An app's KeyStore has no GUI to share it with. A bare executable has no JavaVM, which QJniEnvironment
+    // dereferences unchecked on QtKeychain's first JNI call.
+    return QJniEnvironment::javaVM() == nullptr;
+#else
+    // The keychain files entries by profile name, so it would share them with a GUI profile of the same name
+    return true;
+#endif
+}
+
+void MudletApp::chooseConfigRoot(const QString& path, const bool keepsPasswords)
+{
+    setConfigPath(path, keepsPasswords);
+#if defined(Q_OS_ANDROID)
+    if (!path.isEmpty() && keepsPasswords) {
+        qInfo().noquote() << "MudletApp: no Java VM is registered with Qt, so the passwords for" << path << "are kept in its credentials folder, not the KeyStore";
+    }
+#endif
     const QMutexLocker locker(&configRootMutex);
     configRootChosenByFrontend = !path.isEmpty();
 }
@@ -891,6 +912,7 @@ QPair<bool, QString> MudletApp::writeProfileData(const QString& profile, const Q
         SecureStringUtils::confirmFileIsOwnerOnly(file.fileName());
     }
 
+    TAppFrontend::instance()->configWritten();
     return qMakePair(true, QString());
 }
 
@@ -908,18 +930,22 @@ QPair<bool, QString> MudletApp::setProfileIcon(const QString& profile, const QSt
         return {false, qsl("couldn't copy icon file into new location")};
     }
 
+    TAppFrontend::instance()->configWritten();
     return {true, QString()};
 }
 
 QPair<bool, QString> MudletApp::resetProfileIcon(const QString& profile)
 {
-    QDir dir;
     auto profileIconPath = getMudletPath(enums::profileDataItemPath, profile, qsl("profileicon"));
-    if (QFileInfo::exists(profileIconPath) && !dir.remove(profileIconPath)) {
+    if (!QFileInfo::exists(profileIconPath)) {
+        return {true, QString()};
+    }
+    if (!QFile::remove(profileIconPath)) {
         qWarning() << "MudletApp::resetProfileIcon() ERROR: couldn't remove existing icon" << profileIconPath;
         return {false, qsl("couldn't remove existing icon file")};
     }
 
+    TAppFrontend::instance()->configWritten();
     return {true, QString()};
 }
 
