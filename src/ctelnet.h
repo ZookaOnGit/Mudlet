@@ -404,6 +404,9 @@ private:
     friend class MirrorToStdOutTest;
     friend class NawsWidthReportTest;
 
+    // Reads mAutoReconnect and the failed-connection retry timer, which have no public face
+    friend class ConnectionDialogOpenProfileTest;
+
     // Shorten mFailedConnectionRetryDelay and mNetworkLatencyTimeout rather than sitting them out
     friend class TelnetConnectFailureTest;
     friend class TelnetLatencyMeasurementTest;
@@ -434,6 +437,7 @@ private:
     // feedTelnet(...) Lua function.
     void processSocketData(char* data, int size, const bool loopbackTesting = false);
     void recordReplayChunk(qint32 interval, const char* data, qint32 length);
+    QByteArray redactedForReplay(const char* data, qint32 length);
     void initStreamDecompressor();
     int decompressBuffer(char*& in_buffer, int& length, char* out_buffer);
     // Sends DONT for the running MCCP stream and stops decompressing it, for a
@@ -733,6 +737,11 @@ private:
     int mRecordingChunkCount = 0;
     std::unique_ptr<QSaveFile> mpReplayFile;
     bool mRecordReplay = false;
+    // Where redactedForReplay() has got to, kept between reads as a message can be split across them
+    enum class ReplayRedaction { Text, Iac, NegotiatedOption, SubnegotiationOption, GmcpName, Withheld, WithheldIac };
+    ReplayRedaction mReplayRedaction = ReplayRedaction::Text;
+    bool mReplayRedactionUnseeded = false;
+    QByteArray mReplayGmcpName;
     int mCycleCountMTTS = 0;
     QSet<QString> newEnvironVariablesSent;
     bool mReplayHasFaultyFormat = false;
